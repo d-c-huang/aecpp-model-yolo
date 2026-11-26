@@ -79,7 +79,7 @@ if errorlevel 1 (
 
 :check_dependencies
 echo [4/4] Checking application dependencies...
-".venv\Scripts\python.exe" -c "import tkinter, av, PIL, yaml, scipy, yt_dlp, psutil, ultralytics, torch; print('Tk:', tkinter.TkVersion, 'PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+".venv\Scripts\python.exe" -c "import tkinter, av, PIL, yaml, scipy, yt_dlp, psutil, ultralytics, torch, bs4; print('Tk:', tkinter.TkVersion, 'PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available())"
 if errorlevel 1 (
     echo [ERROR] A dependency could not be imported. See the error above.
     echo Run setup.cmd to install or repair the local requirements.

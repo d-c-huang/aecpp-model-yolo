@@ -1,11 +1,13 @@
 """Non-modal, review-first movie research and training preparation."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import webbrowser
 
+import film_web
 import movie_profiles as profiles
 import theme
 
@@ -24,6 +26,7 @@ class MovieProfileWindow:
         self._closed, self._loading, self._dirty, self._notified = False, False, False, False
         self._timer, self._search_token, self._searching = None, 0, False
         self._events = queue.Queue()
+        self._auto_attempted = set()
         self._current_id, self._profile, self._candidates = None, None, []
         self.win = tk.Toplevel(parent)
         self.win.title("影片资料 · 学习准备")
@@ -34,6 +37,7 @@ class MovieProfileWindow:
         self.win.bind("<Destroy>", self._destroyed, add="+")
         self.title = tk.StringVar()
         self.year = tk.StringVar()
+        self.engine = tk.StringVar(value="Bing")
         self.allow_missing = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="学习前先核对影片资料；演员、角色和剧情将保存在本工程中。")
         style = ttk.Style(self.win)
@@ -41,8 +45,8 @@ class MovieProfileWindow:
         style.configure("Profile.TNotebook.Tab", background=theme.PANEL, foreground=theme.MUTED, padding=(12, 5))
         style.map("Profile.TNotebook.Tab", background=[("selected", theme.RAISED)], foreground=[("selected", theme.ACCENT)])
         self._build()
-        self.title.trace_add("write", self._changed)
-        self.year.trace_add("write", self._changed)
+        self.title.trace_add("write", self._identity_changed)
+        self.year.trace_add("write", self._identity_changed)
         self.allow_missing.trace_add("write", self._changed)
         self._refresh_movies()
         missing = profiles.required_missing(root, self.movie_ids)
@@ -89,7 +93,9 @@ class MovieProfileWindow:
         ttk.Entry(identity, textvariable=self.year, width=7).grid(row=0, column=3)
         tools = ttk.Frame(main)
         tools.grid(row=1, column=0, sticky="ew", pady=(0, 9))
-        self.search_button = ttk.Button(tools, text="联网查找资料", command=self._search, style="Accent.TButton")
+        ttk.Combobox(tools, textvariable=self.engine, values=list(film_web.ENGINES),
+                     width=7, state="readonly").pack(side="left", padx=(0, 5))
+        self.search_button = ttk.Button(tools, text="查询并填充", command=self._search, style="Accent.TButton")
         self.search_button.pack(side="left")
         ttk.Button(tools, text="浏览器中查询 ↗", command=self._browser_search).pack(side="left", padx=6)
         ttk.Button(tools, text="导入资料 JSON", command=self._import_json, style="Compact.TButton").pack(side="right")
@@ -152,6 +158,13 @@ class MovieProfileWindow:
         if not self._loading:
             self._dirty = True
 
+    def _identity_changed(self, *_):
+        if not self._loading:
+            self._dirty = True
+            if self._searching or self._candidates:
+                self._reset_search()
+                self.status.set("片名或年份已修改，可重新查询。")
+
     def _text_changed(self, widget):
         if widget.edit_modified():
             self._changed()
@@ -185,6 +198,20 @@ class MovieProfileWindow:
         if self._dirty and self._current_id is not None and not self._save(False, advance=False):
             self.movies.selection_set(str(self._current_id))
             return
+        self._reset_search()
+        self._current_id = movie_id
+        self._set_fields(profiles.get(self.root, movie_id))
+        self.movies.selection_set(str(movie_id))
+        self.movies.see(str(movie_id))
+        self.status.set(self._profile.get("research", {}).get("message") or "核对角色、演员和剧情后确认；未知资料可以手工填写。")
+        research = self._profile.get("research", {})
+        retry = research.get("status") in {"failed", "not-found"}
+        if not profiles.is_ready(self._profile) and (not research.get("attempted_at") or
+                research.get("status") == "found" or (retry and movie_id not in self._auto_attempted)):
+            self._auto_attempted.add(movie_id)
+            self._search()
+
+    def _reset_search(self):
         self._search_token += 1
         self._searching = False
         self.search_button.configure(state="normal")
@@ -192,13 +219,7 @@ class MovieProfileWindow:
         self.candidates.delete(*self.candidates.get_children())
         self.lookup.grid_remove()
         self._candidates = []
-        self._current_id = movie_id
-        self._set_fields(profiles.get(self.root, movie_id))
-        self.movies.selection_set(str(movie_id))
-        self.movies.see(str(movie_id))
-        self.status.set(self._profile.get("research", {}).get("message") or "核对角色、演员和剧情后确认；未知资料可以手工填写。")
-        if not profiles.is_ready(self._profile) and not self._profile.get("research", {}).get("attempted_at"):
-            self._search()
+        self._version_profiles = {}
 
     def _set_fields(self, profile):
         self._loading = True
@@ -231,6 +252,8 @@ class MovieProfileWindow:
             profile = profiles.save(self.root, self._current_id, self._fields(), confirm=confirm,
                                     allow_missing=self.allow_missing.get())
             self._profile, self._dirty = profile, False
+            if confirm:
+                self._reset_search()
             self._refresh_movies()
             self.status.set("资料已确认，将用于之后的学习。" if confirm else "草稿已保存；确认后才能进入训练。")
             if confirm and advance:
@@ -269,17 +292,32 @@ class MovieProfileWindow:
             return
         if self._dirty and not self._save(False, advance=False):
             return
-        title, year = self.title.get(), self.year.get()
-        self.status.set("正在查询公共影片资料… 可继续编辑；网络失败时可手动填写。")
-        self._worker("search", lambda: profiles.search_online(title, year))
+        title, year, engine = self.title.get(), self.year.get(), self.engine.get()
+        self._reset_search()
+        query, _ = film_web.identity(title, year)
+        self.status.set(f"正在使用 {engine} 和影片数据库查询《{query}》…")
+        self._worker("search", lambda: profiles.search_online(title, year, engine))
 
     def _fetch(self):
         selected = self.candidates.selection()
         if self._searching or not selected:
             return
         candidate = self._candidates[int(selected[0])]
+        cached = self._version_profiles.get(candidate["id"])
         self.status.set("正在读取所选电影的演员、角色与剧情；读取后仍需人工核对。")
-        self._worker("fetch", lambda: profiles.fetch_candidate(candidate))
+        self._worker("fetch", lambda: cached or profiles.fetch_candidate(candidate))
+
+    @staticmethod
+    def _read_versions(versions):
+        details = {}
+        with ThreadPoolExecutor(max_workers=3) as readers:
+            jobs = {row["id"]: readers.submit(profiles.fetch_candidate, row) for row in versions[:3]}
+            for identifier, future in jobs.items():
+                try:
+                    details[identifier] = future.result()
+                except (OSError, ValueError):
+                    continue
+        return details
 
     def _poll(self):
         if self._closed:
@@ -301,6 +339,10 @@ class MovieProfileWindow:
             self._searching = False
             self.search_button.configure(state="normal")
             if error:
+                if kind != "search":
+                    self.apply_candidate.configure(state="normal" if self.candidates.selection() else "disabled")
+                    self.status.set("候选资料读取失败，可重试或选择其他条目。"+error)
+                    continue
                 result = {"query": self.title.get(), "status": "failed", "message": "在线资料读取失败："+error+"；请手动填写或重试。"}
                 kind = "search"
             if kind == "search":
@@ -313,10 +355,32 @@ class MovieProfileWindow:
                 self._profile["research"] = recorded["research"]
                 self._profile["status"] = recorded["status"]
                 self.status.set(result["message"])
+                match = result.get("match")
+                if match and not profiles.is_ready(self._profile):
+                    self.candidates.selection_set(str(self._candidates.index(match)))
+                    self.status.set("已匹配《"+match["title"]+"》，正在读取资料…")
+                    self._worker("autofill", lambda item=match: profiles.fetch_candidate(item))
+                elif result.get("versions"):
+                    versions = result["versions"]
+                    self.status.set(f"《{result['query']}》有多个同名版本，正在读取各版主演…")
+                    self._worker("versions", lambda rows=versions: self._read_versions(rows))
+            elif kind == "versions":
+                self._version_profiles = result
+                for index, row in enumerate(self._candidates):
+                    profile = result.get(row["id"])
+                    if profile:
+                        actors = list(dict.fromkeys(c["actor"] for c in profile["cast"] if c["actor"]))
+                        note = " · ".join(filter(None, [row["description"], "、".join(actors[:3])]))
+                        self.candidates.item(str(index), values=(row["title"], note))
+                if self.candidates.selection():
+                    self.apply_candidate.configure(state="normal")
+                self.status.set("有多个同名版本。请按年份和主演双击对应版本，填入演员和剧情。")
+            elif kind == "autofill":
+                self._autofill(result)
             else:
                 # Network suggestions never erase unsaved edits or silently replace a confirmed profile.
                 current = self._fields()
-                has_content = self._dirty or bool(current.get("cast") or current.get("synopsis") or current.get("events"))
+                has_content = self._dirty or profiles.is_ready(current) or bool(current.get("cast") or current.get("synopsis") or current.get("events"))
                 if has_content and not messagebox.askyesno("采用网上资料", "将用所选候选的演员表和剧情替换当前编辑内容。是否采用？\n已有训练快照不受影响。", parent=self.win):
                     self.status.set("已保留当前编辑内容。可以打开候选来源核对后手工补充。")
                     continue
@@ -330,8 +394,35 @@ class MovieProfileWindow:
                 self.status.set(result["research"]["message"])
             self._refresh_movies()
 
+    def _autofill(self, result):
+        self.apply_candidate.configure(state="normal")
+        current = self._fields()
+        title, year = film_web.identity(current["title"], current["year"])
+        if year and year != result.get("year"):
+            self.status.set("资料页的上映年份与查询不一致，请核对候选。")
+            return
+        added = []
+        for field, label in (("year", "年份"), ("cast", "演员表"), ("synopsis", "剧情")):
+            if not current[field] and result.get(field):
+                current[field] = result[field]
+                added.append(label)
+        if not added:
+            self.status.set("当前资料没有可自动补充的字段，可选择候选后手动采用。")
+            return
+        if current["title"] != title:
+            current["title"] = current["research"].get("query") or title
+        current["sources"].extend(result.get("sources", []))
+        message = "已自动填充"+"、".join(added)+"并保存为草稿，请核对后确认。"
+        current["research"] = {**result["research"], "message": message}
+        allow_missing = self.allow_missing.get()
+        self._set_fields(profiles.save(self.root, self._current_id, current))
+        if allow_missing:
+            self.allow_missing.set(True)
+        self.lookup.grid_remove()
+        self.status.set(message)
+
     def _browser_search(self):
-        webbrowser.open(profiles.search_url(self.title.get(), self.year.get()), new=2)
+        webbrowser.open(profiles.search_url(self.title.get(), self.year.get(), self.engine.get()), new=2)
 
     def _import_json(self):
         path = filedialog.askopenfilename(parent=self.win, title="导入影片资料", filetypes=[("JSON 资料", "*.json")])
@@ -344,6 +435,7 @@ class MovieProfileWindow:
                 raise ValueError("资料文件须包含一个 JSON 对象")
             profile = profiles.clean_profile(data, self._current_id)
             profile["status"] = "draft"
+            self._reset_search()
             self._set_fields(profile)
             self._dirty = True
             self._save(False, advance=False)

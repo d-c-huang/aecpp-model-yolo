@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from dataset import connect
+import film_web
 
 
 VERSION = 1
@@ -143,7 +144,7 @@ def clean_profile(profile, movie_id):
             urls.add(url)
     if isinstance(profile.get("research"), dict):
         result["research"] = {key: _text(profile["research"].get(key), 2000, "检索记录")
-                              for key in ("attempted_at", "query", "status", "message")}
+                              for key in ("attempted_at", "query", "status", "message", "engine")}
     return result
 
 
@@ -187,7 +188,8 @@ def record_research(root, movie_id, result):
     """Record a search attempt without clobbering existing human-written fields."""
     profile = get(root, movie_id)
     profile["research"] = {"attempted_at": _now(), "query": result.get("query", profile["title"]),
-                            "status": result.get("status", "failed"), "message": result.get("message", "")}
+                            "status": result.get("status", "failed"), "message": result.get("message", ""),
+                            "engine": result.get("engine", "")}
     return save(root, movie_id, profile, confirm=is_ready(profile), allow_missing=profile.get("allow_missing", False))
 
 
@@ -240,8 +242,8 @@ def format_events(events):
                      + "、".join(event.get("roles", [])) for event in events)
 
 
-def search_url(title, year=""):
-    return "https://www.bing.com/search?" + urlencode({"q": f"{title} {year} 电影 演员 角色 剧情".strip()})
+def search_url(title, year="", engine="Bing"):
+    return film_web.search_url(*film_web.identity(title, year), engine)
 
 
 def _api(url, params, *, timeout=8):
@@ -257,13 +259,32 @@ def _api(url, params, *, timeout=8):
     return result
 
 
-def search_online(title, year="", *, api=None):
-    """Return alternatives; never auto-select a film based on title alone."""
-    api = api or _api
-    query = _text(title, 300, "查询标题")
+def search_online(title, year="", engine="Bing", *, api=None, web_search=film_web.search_candidates):
+    query, year = film_web.identity(_text(title, 300, "查询标题"), year)
     if not query:
         raise ValueError("请先填写要查询的电影标题")
-    errors, candidates, seen = [], [], set()
+    candidates, errors = web_search(query, year, engine)
+    # Some uploaders append a release year directly, e.g. 家有喜事1992.
+    # Prefer the literal title for films whose name really contains the year.
+    suffix = re.fullmatch(rf"(.+[\u3400-\u9fff])({film_web.YEAR})", query)
+    if suffix and (not year or year == suffix[2]) and not film_web.exact_titles(query, candidates):
+        alternatives, more_errors = web_search(suffix[1], suffix[2], engine)
+        if film_web.unique_match(suffix[1], suffix[2], alternatives):
+            query, year, candidates = suffix[1], suffix[2], alternatives
+        errors.extend(more_errors)
+    if candidates:
+        match = film_web.unique_match(query, year, candidates)
+        versions = [row for row in film_web.exact_titles(query, candidates) if row.get("catalogued")
+                    and (not year or row.get("year") == year)]
+        return {"query": query, "status": "found", "engine": engine, "candidates": candidates,
+                "match": match, "versions": versions if len(versions) > 1 and not match else [],
+                "message": f"找到 {len(candidates)} 个影片条目，可按片名和年份选择。"}
+    return {**_search_wikidata(query, year, api=api, errors=errors), "engine": engine}
+
+
+def _search_wikidata(query, year, *, api, errors):
+    api = api or _api
+    candidates, seen = [], set()
     for language in ("zh", "en"):
         try:
             response = api(WIKIDATA, {"action": "wbsearchentities", "search": query,
@@ -311,6 +332,11 @@ def fetch_candidate(candidate, *, api=None):
     """Fetch public claims and attributable article text for explicit review."""
     api = api or _api
     entity_id = candidate.get("id", "")
+    if entity_id.startswith("tmdb:"):
+        profile = film_web.fetch(entity_id.removeprefix("tmdb:"))
+        profile["research"] = {"attempted_at": _now(), "query": candidate["title"],
+                               "status": "selected", "message": "已读取 TMDB 资料，请核对后确认。"}
+        return profile
     if not re.fullmatch(r"Q\d+", entity_id):
         raise ValueError("请选择有效的电影候选")
     response = api(WIKIDATA, {"action": "wbgetentities", "ids": entity_id,

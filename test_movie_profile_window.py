@@ -21,7 +21,8 @@ class MovieProfileWindowTests(unittest.TestCase):
         with dataset.connect(self.root) as db:
             db.executemany("INSERT INTO movies(id,digest,name,mode) VALUES(?,?,?,'train')",[(1,"one","电影甲"),(2,"two","电影乙")])
         for movie_id in (1,2):
-            profiles.record_research(self.root,movie_id,{"query":"电影","status":"not-found","message":"请手工填写"})
+            profiles.record_research(self.root,movie_id,{"query":profiles.get(self.root,movie_id)["title"],
+                                     "status":"selected","engine":"Bing","message":"请核对"})
         try:
             self.tk = tk.Tk()
         except tk.TclError as exc:
@@ -108,6 +109,46 @@ class MovieProfileWindowTests(unittest.TestCase):
         self.assertIsNone(self.window._timer)
         self.closed.assert_called_once_with()
         self.ready.assert_not_called()
+
+    def test_matching_candidate_fills_and_saves_draft_around_manual_edits(self):
+        window = self.window
+        self.fill()
+        self.assertTrue(window._save(False))
+        candidate = {"id":"tmdb:12", "title":"电影甲", "description":"1995", "year":"1995"}
+        result = {"query":"电影甲", "status":"found", "candidates":[candidate], "match":candidate, "message":"已找到"}
+        details = {"year":"1995", "cast":[], "synopsis":"网上剧情", "sources":[{"url":"https://example.org/12"}],
+                   "research":{"status":"selected"}}
+        with patch("movie_profiles.fetch_candidate", return_value=details) as fetch:
+            window._events.put((window._search_token, 1, "search", result, None))
+            window._receive()
+            deadline = time.monotonic()+2
+            while window._searching and time.monotonic()<deadline:
+                window._receive()
+                time.sleep(.01)
+        fetch.assert_called_once_with(candidate)
+        draft = profiles.get(self.root, 1)
+        self.assertEqual((draft["year"], draft["status"], draft["synopsis"]), ("1995","draft","故事情节"))
+        self.assertEqual(draft["sources"][0]["url"], "https://example.org/12")
+        self.assertEqual(draft["cast"][0]["role"], "角色甲")
+        self.ready.assert_not_called()
+
+    def test_changing_query_discards_pending_autofill(self):
+        window = self.window
+        token = window._search_token
+        window._searching = True
+        window.year.set("2001")
+        window._events.put((token, 1, "autofill", {"year":"1995"}, None))
+        window._receive()
+        self.assertEqual(window.year.get(), "2001")
+        self.assertEqual(profiles.get(self.root, 1)["year"], "")
+
+    def test_reopen_retries_previous_miss_once_per_window(self):
+        profiles.record_research(self.root, 2, {"query":"电影乙","status":"not-found","engine":"百度"})
+        with patch.object(self.window, "_search") as search:
+            self.window._load(2)
+            self.window._load(1)
+            self.window._load(2)
+        search.assert_called_once()
 
     def test_small_window_keeps_review_actions_visible(self):
         self.window.win.deiconify()
