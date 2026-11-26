@@ -6,6 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 import uuid
 
 from PIL import Image, ImageTk
+import theme
 from dataset import connect, role_names
 from tracking import assign_role, film_tracks, films_with_tracks
 
@@ -19,15 +20,13 @@ class RoleReview:
         if not self.films:
             messagebox.showinfo("角色确认","先点击「分析片段」，选择电影和人物出现的时段。",parent=parent)
             return
-        self.win = tk.Toplevel(parent)
-        self.win.title("角色确认 · 按轨迹分组")
-        self.win.transient(parent)
+        self.win,panel = theme.sheet(parent,"角色确认")
         self.win.grab_set()
         self.selected = set()
         self.anchor = None
         self.page = 0
         self.images = []
-        head = ttk.Frame(self.win,padding=8)
+        head = ttk.Frame(panel)
         head.pack(fill="x")
         self.film = ttk.Combobox(head,state="readonly",width=38,
                                  values=[f"{f['name']}  ·  {f['id']}" for f in self.films])
@@ -39,21 +38,21 @@ class RoleReview:
         self.scope.pack(side="left")
         self.scope.bind("<<ComboboxSelected>>",lambda _:self.load())
         ttk.Button(head,text="导出已确认轨迹",command=self.export).pack(side="right")
-        ttk.Label(self.win,text="勾选同一角色的轨迹后统一命名。每张卡片展示起始、代表和末尾三个画面。",padding=6).pack(anchor="w")
-        self.body = ttk.Frame(self.win,padding=4)
+        ttk.Label(panel,text="勾选同一角色的轨迹后统一命名。",style="Muted.TLabel").pack(anchor="w",pady=8)
+        self.body = ttk.Frame(panel)
         self.body.pack(fill="both",expand=True)
-        nav = ttk.Frame(self.win,padding=6)
+        nav = ttk.Frame(panel,padding=(0,8))
         nav.pack(fill="x")
         ttk.Button(nav,text="上一页",command=lambda:self.turn(-1)).pack(side="left")
         ttk.Button(nav,text="下一页",command=lambda:self.turn(1)).pack(side="left")
         self.summary = tk.StringVar()
         ttk.Label(nav,textvariable=self.summary).pack(side="left",padx=8)
-        foot = ttk.Frame(self.win,padding=8)
+        foot = ttk.Frame(panel)
         foot.pack(fill="x")
         ttk.Label(foot,text="本片角色").pack(side="left")
         self.name = ttk.Combobox(foot,width=22)
         self.name.pack(side="left",padx=4)
-        ttk.Button(foot,text="确认所选轨迹",command=self.apply).pack(side="left")
+        ttk.Button(foot,text="确认所选轨迹",command=self.apply,style="Primary.TButton").pack(side="left")
         ttk.Button(foot,text="撤回所选角色名",command=lambda:self.apply(clear=True)).pack(side="left",padx=4)
         self.load()
 
@@ -101,8 +100,10 @@ class RoleReview:
             w.destroy()
         self.images.clear()
         for i,r in enumerate(self.rows[self.page*self.PAGE:(self.page+1)*self.PAGE]):
-            card = ttk.Frame(self.body,padding=5,relief="groove")
-            card.grid(row=i//3,column=i%3,sticky="nsew",padx=3,pady=3)
+            outline = ttk.Frame(self.body,style="Outline.TFrame",padding=1)
+            outline.grid(row=i//3,column=i%3,sticky="nsew",padx=3,pady=3)
+            card = ttk.Frame(outline,padding=7)
+            card.pack(fill="both",expand=True)
             with Image.open(io.BytesIO(r["preview"])) as im:
                 pic = ImageTk.PhotoImage(im)
             self.images.append(pic)

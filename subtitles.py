@@ -2,6 +2,7 @@
 from collections import defaultdict
 import hashlib
 import io
+import os
 from pathlib import Path
 import re
 import shutil
@@ -17,6 +18,15 @@ from dataset import connect
 
 TEXT_CODECS = {"srt","subrip","text","ssa","ass","webvtt","mov_text"}
 SIDECARS = {".srt":"srt", ".vtt":"webvtt", ".ass":"ass", ".ssa":"ass"}
+
+
+def decode_text(data):
+    if data.startswith((b"\xff\xfe",b"\xfe\xff")):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("gb18030")
 
 
 def packet_text(packet):
@@ -73,6 +83,34 @@ def store_track(root, movie, source, label, fingerprint, cues):
                        ((track,*cue) for cue in cues))
 
 
+def file_cues(path, data, progress):
+    fmt = SIDECARS.get(path.suffix.lower())
+    if not fmt:
+        raise ValueError("请选择 SRT、VTT、ASS 或 SSA 字幕文件")
+    with av.open(io.BytesIO(decode_text(data).encode("utf-8")),format=fmt) as sub:
+        stream = sub.streams.subtitles[0]
+        return read_cues(sub,[stream],0,progress)[stream.index]
+
+
+def import_subtitles(root, movie, path, progress):
+    path = Path(path)
+    data = path.read_bytes()
+    cues = file_cues(path,data,progress)
+    if not cues:
+        raise ValueError("字幕文件没有可用的文字或时间码")
+    # Keep a manual track separate only when the movie index cannot update the same file.
+    with connect(root) as db:
+        source_path = db.execute("SELECT source_path FROM movies WHERE id=?",(movie,)).fetchone()[0]
+    film = Path(source_path) if source_path else None
+    is_sidecar = (film and path.resolve().parent==film.parent and
+                  (path.stem.casefold()==film.stem.casefold() or
+                   path.stem.casefold().startswith(film.stem.casefold()+".")))
+    location = hashlib.sha256(os.path.normcase(str(path.resolve())).encode("utf-8")).hexdigest()
+    key = "sidecar:"+path.name if is_sidecar else f"import:{location}"
+    store_track(root,movie,key,path.name,hashlib.sha256(data).hexdigest(),cues)
+    return len(cues)
+
+
 def index_movie(root, movie, path, origin, progress):
     with connect(root) as db:
         cached = dict(db.execute("SELECT source,fingerprint FROM subtitle_tracks WHERE movie=?",(movie,)))
@@ -102,28 +140,38 @@ def index_movie(root, movie, path, origin, progress):
             key = "sidecar:"+file.name
             if cached.get(key)==digest:
                 continue
-            if data.startswith((b"\xff\xfe",b"\xfe\xff")):
-                content = data.decode("utf-16")
-            else:
-                try:
-                    content = data.decode("utf-8-sig")
-                except UnicodeDecodeError:
-                    content = data.decode("gb18030")
-            with av.open(io.BytesIO(content.encode("utf-8")),format=fmt) as sub:
-                stream = sub.streams.subtitles[0]
-                cues = read_cues(sub,[stream],0,progress)[stream.index]
+            cues = file_cues(file,data,progress)
             store_track(root,movie,key,file.name,digest,cues)
         except (av.FFmpegError,OSError,UnicodeError,IndexError) as exc:
             warnings.append(f"{file.name} 读取失败：{exc}")
     return warnings
 
 
-def candidates(root,movie,ms):
+def candidates(root,movie,ms,*,nearby_ms=0):
     with connect(root) as db:
-        rows = db.execute("""SELECT t.source,t.label,c.start_ms,c.end_ms,c.text FROM subtitle_cues c
+        rows = db.execute("""SELECT t.id AS track_id,t.source,t.label,c.start_ms,c.end_ms,c.text,c.original_text
+                    FROM effective_subtitle_cues c
                     JOIN subtitle_tracks t ON c.track=t.id WHERE t.movie=? AND c.start_ms<=? AND c.end_ms>?
-                    ORDER BY t.label,c.start_ms,c.end_ms,c.text""",(movie,ms,ms))
+                    ORDER BY t.label,c.start_ms,c.end_ms,c.text,c.original_text""",(movie,ms+nearby_ms,ms-nearby_ms))
         return [dict(row) for row in rows]
+
+
+def correct_cue(root,movie,cue,text):
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if not text:
+        raise ValueError("请输入修正后的字幕")
+    key = (cue["track_id"],cue["start_ms"],cue["end_ms"],cue["original_text"])
+    with connect(root) as db:
+        db.execute("BEGIN IMMEDIATE")
+        exists = db.execute("""SELECT 1 FROM subtitle_cues c JOIN subtitle_tracks t ON t.id=c.track
+                            WHERE c.track=? AND c.start_ms=? AND c.end_ms=? AND c.text=? AND t.movie=?""",(*key,movie))
+        if exists.fetchone() is None:
+            raise ValueError("原字幕已更新，请重新打开标注窗口")
+        if text==cue["original_text"]:
+            db.execute("DELETE FROM subtitle_corrections WHERE (track,start_ms,end_ms,original_text)=(?,?,?,?)",key)
+        else:
+            db.execute("""INSERT INTO subtitle_corrections VALUES(?,?,?,?,?)
+                       ON CONFLICT(track,start_ms,end_ms,original_text) DO UPDATE SET text=excluded.text""",(*key,text))
 
 
 def list_tracks(root):
@@ -143,7 +191,7 @@ def export_srt(root,track,path):
     tmp = path.with_name(uuid.uuid4().hex+".tmp")
     try:
         with connect(root) as db,tmp.open("x",encoding="utf-8-sig") as out:
-            rows = db.execute("SELECT start_ms,end_ms,text FROM subtitle_cues WHERE track=? ORDER BY start_ms,end_ms,text",(track,))
+            rows = db.execute("SELECT start_ms,end_ms,text FROM effective_subtitle_cues WHERE track=? ORDER BY start_ms,end_ms,text",(track,))
             for number,(start,end,text) in enumerate(rows,1):
                 out.write(f"{number}\n{clock(start)} --> {clock(end)}\n{text}\n\n")
         tmp.replace(path)

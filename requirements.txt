@@ -3,3 +3,5 @@ Pillow>=9.1
 PyYAML>=6
 av>=14,<18
 scipy>=1.10
+yt-dlp==2026.11.23
+psutil>=5.9,<8

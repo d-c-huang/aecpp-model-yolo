@@ -1,5 +1,6 @@
 """Decode local video by stream content and sample its presentation timeline."""
 from contextlib import contextmanager
+from itertools import chain
 import math
 from pathlib import Path
 
@@ -62,24 +63,47 @@ class Movie:
             yield max(0.,t),frame
             t += self.interval
 
+    def seek_decoder(self, target):
+        try:
+            offset = int((target + self.origin) / self.stream.time_base)
+            self.container.seek(offset, stream=self.stream, backward=True)
+            iterator = self.decoded(target)
+            candidate = next(iterator,None)
+            if candidate is None or candidate[0] > target + self.interval*2:
+                raise ValueError("索引未定位到请求时段")
+            return iterator,candidate
+        except (self.av.FFmpegError, ValueError, OverflowError):
+            self.seekable = False
+            self.open()
+            return self.decoded(0),None
+
+    def frames_between(self, start, end):
+        self.open()
+        iterator = self.decoded(0)
+        if self.seekable and start>3:
+            # Start before the range so the first frame inside it is included.
+            iterator,current = self.seek_decoder(max(0,start-self.interval*3))
+            if current is not None:
+                iterator = chain((current,),iterator)
+        for timestamp,frame in iterator:
+            if timestamp>=end:
+                break
+            if timestamp>=start:
+                yield timestamp,frame
+
+    @staticmethod
+    def frame_image(frame):
+        image = frame.to_image()
+        angle = getattr(frame,"rotation",0)
+        return image.rotate(angle,expand=True) if angle else image
+
     def samples(self, times):
         """Yield (actual seconds, RGB image) for increasing requested times."""
         iterator = self.decoded(0)
         current = None
         for target in times:
             if self.seekable and target - (current[0] if current else 0) > 3:
-                try:
-                    offset = int((target + self.origin) / self.stream.time_base)
-                    self.container.seek(offset, stream=self.stream, backward=True)
-                    iterator = self.decoded(target)
-                    candidate = next(iterator,None)
-                    if candidate is None or candidate[0] > target + self.interval*2:
-                        raise ValueError("索引未定位到请求时段")
-                    current = candidate
-                except (self.av.FFmpegError, ValueError, OverflowError):
-                    self.seekable = False
-                    self.open()
-                    iterator, current = self.decoded(0), None
+                iterator,current = self.seek_decoder(target)
             while current is None or current[0] + self.interval*.5 < target:
                 following = next(iterator,None)
                 if following is None:
@@ -88,11 +112,7 @@ class Movie:
                     break
                 current = following
             t,frame = current
-            image = frame.to_image()
-            angle = getattr(frame,"rotation",0)
-            if angle:
-                image = image.rotate(angle,expand=True)
-            yield t,image
+            yield t,self.frame_image(frame)
 
 
 @contextmanager
