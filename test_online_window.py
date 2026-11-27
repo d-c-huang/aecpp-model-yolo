@@ -1,5 +1,6 @@
 """UI contract checks use temporary movie records and a manager with no workers."""
 from copy import deepcopy
+import gc
 from pathlib import Path
 import tempfile
 import tkinter as tk
@@ -66,6 +67,7 @@ class FakeManager:
 
 class OnlineWindowTests(unittest.TestCase):
     def setUp(self):
+        gc.collect()  # Finalize old Tk fixtures on the UI thread, never a worker.
         self.temporary = tempfile.TemporaryDirectory(prefix="online-window-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -92,10 +94,13 @@ class OnlineWindowTests(unittest.TestCase):
         self.addCleanup(self.window.close)
 
     def destroy_tk(self):
+        self.tk.report_callback_exception = None
         try:
             self.tk.destroy()
         except tk.TclError:
             pass  # A lifecycle test may already have destroyed the root.
+        self.container = self.window = self.tk = None
+        gc.collect()
 
     def completed(self, identifier="done", **kwargs):
         return {"id": identifier, "url": "https://example.test/movie.mp4", "title": "测试影片", "status": "completed",
@@ -137,6 +142,36 @@ class OnlineWindowTests(unittest.TestCase):
         self.assertIn(("start",), self.manager.calls)
         self.assertEqual(self.window.tree.selection(), ("1",))
 
+    def test_auto_mode_freezes_queue_options_routes_feed_and_persists_preference(self):
+        self.window.close()
+        auto_learn, auto_open = Mock(), Mock()
+        self.window = online.OnlineWindow(self.tk, self.manager, on_open_movie=self.open_movie,
+                                          on_learn=self.learn, on_open_training=Mock(),
+                                          on_auto_learn=auto_learn, on_auto_learning=auto_open)
+        self.addCleanup(self.window.close)
+        self.assertEqual(self.window.learning_kind.get(), "自动编排学习（推荐）")
+        self.window.links.insert("1.0", "https://example.test/automatic")
+        self.window._add()
+        self.assertEqual(self.manager.calls[0][1]["learning_kind"], "story-reference")
+        self.manager.jobs.append(self.completed())
+        self.select("done")
+        self.window._feed()
+        auto_learn.assert_called_once_with([1])
+        self.learn.assert_not_called()
+        self.window._open_auto_learning()
+        auto_open.assert_called_once()
+        self.window.learning_kind.set("电影时序训练")
+        self.window.learn.set(False)
+        self.assertEqual(self.manager.jobs[0]["config"]["learning_kind"], "story-reference")
+        self.window._feed()
+        self.learn.assert_called_once_with([1])
+        self.window.close()
+        self.window = online.OnlineWindow(self.tk, self.manager, on_open_movie=self.open_movie,
+                                          on_learn=self.learn, on_open_training=Mock(), on_auto_learn=auto_learn)
+        self.addCleanup(self.window.close)
+        self.assertEqual(self.window.learning_kind.get(), "电影时序训练")
+        self.assertFalse(self.window.learn.get())
+
     def test_resume_and_retry_refresh_training_request_version(self):
         self.manager.paused = True
         self.window._toggle_pause()
@@ -145,6 +180,32 @@ class OnlineWindowTests(unittest.TestCase):
         self.select("done")
         self.window._retry()
         self.assertIn(("retry", ["done"], {"request_version": 9}), self.manager.calls)
+
+    def test_discovery_entry_and_combined_movie_learning_details(self):
+        self.window.close()
+        discover = Mock()
+        self.window = online.OnlineWindow(self.tk, self.manager, on_open_movie=self.open_movie,
+            on_learn=self.learn, on_open_training=Mock(), on_auto_learning=Mock(), on_auto_learn=Mock(),
+            on_discovery=discover)
+        self.addCleanup(self.window.close)
+        discover.assert_not_called()
+        self.window.discovery_button.invoke()
+        discover.assert_called_once_with()
+        self.manager.jobs = [self.completed(learning_kind="story-and-movie", learn=True)]
+        self.select("done")
+        details = self.window.details_text.get("1.0", "end")
+        self.assertIn("字幕节奏参考 + 电影时序训练", details)
+        self.assertIn("自动学习任务", details)
+        self.assertIn("学习记录", details)
+        self.assertIn("字幕 + 电影任务", self.window.tree.item("done", "values"))
+        self.window.win.geometry("980x700")
+        self.tk.update()
+        right = self.window.win.winfo_rootx()+self.window.win.winfo_width()
+        bottom = self.window.win.winfo_rooty()+self.window.win.winfo_height()
+        for widget in (self.window.discovery_button, self.window.tree, self.window.feed_button):
+            self.assertTrue(widget.winfo_ismapped())
+            self.assertLessEqual(widget.winfo_rootx()+widget.winfo_width(), right)
+            self.assertLessEqual(widget.winfo_rooty()+widget.winfo_height(), bottom)
 
     def test_feed_only_completed_existing_sources_and_deduplicates(self):
         self.manager.jobs = [self.completed(), self.completed("alias"), self.completed("pending", status="running"),
@@ -202,6 +263,11 @@ class OnlineWindowTests(unittest.TestCase):
         self.window.close()
         self.assertIsNone(self.window._timer)
         self.assertTrue(self.manager.busy)
+        for variable in (self.window.search, self.window.filter, self.window.learning_kind, self.window.learn):
+            self.assertEqual(variable.trace_info(), [])
+        self.window._learning_mode_changed = Mock(side_effect=AssertionError("Closed view received a trace callback"))
+        self.window.learning_kind.set("电影时序训练")
+        self.window._learning_mode_changed.assert_not_called()
         self.closed.assert_called_once_with()
 
     def test_minimum_window_has_visible_queue_and_actions(self):

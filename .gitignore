@@ -12,6 +12,16 @@ frames/
 online_media/
 movie_features/
 movie_feature_cache/
+creations/
+story_learning/
+auto_learning/
+discovery/
+video_analysis/
+/video_analysis_settings.json
+/aecpp_resource_bindings.json
+/auto_learning_settings.json
+/continuous_learning.json
+/.continuous-learning.lock
 thumbnails/
 映格工程/
 *.pt

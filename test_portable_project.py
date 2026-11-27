@@ -161,7 +161,7 @@ class PortableProjectTests(unittest.TestCase):
         self.assertFalse((self.target / "custom-cache").exists())
         marker = json.loads((moved.parent / "completed.json").read_text())
         self.assertEqual(marker["mtime_ns"], moved.stat().st_mtime_ns)
-        pending = json.loads((moved.parent / "pending.json").read_text())
+        pending = json.loads((moved.parent / "pending.json").read_text(encoding="utf-8"))
         self.assertEqual(pending["folder"], str(moved.parent))
         self.assertEqual(pending["path"], str(moved))
         cache_storage._check_owner(self.target, self.target / "online_media")
@@ -185,6 +185,43 @@ class PortableProjectTests(unittest.TestCase):
         lock = _ProjectLock(self.root / ".online_queue.lock")
         try:
             with self.assertRaisesRegex(ValueError, "队列仍在运行"):
+                portable.export_project(self.root, self.archive)
+        finally:
+            lock.close()
+        self.assertFalse(self.archive.exists())
+
+    def test_discovery_history_moves_without_network_or_automatic_handoff(self):
+        from discovery_learning import DiscoveryManager
+        search = lambda query, **kwargs: [{"title": "公开动画候选", "url": "https://www.bilibili.com/video/BV1xx411c7m0/",
+                                           "source_url": "https://www.bing.com/search?q=fixture"}]
+        manager = DiscoveryManager(self.root, searcher=search)
+        self.addCleanup(manager.close)
+        round_id = manager.start({"movie_enabled": False})
+        manager._thread.join(4)
+        self.assertFalse(manager.busy)
+        pending = manager.pending_candidates()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["state"], "dispatching")
+        self.round_trip()
+        with patch("discovery_sources.discover", side_effect=AssertionError("migration must not search")):
+            restored = DiscoveryManager(self.target)
+            self.addCleanup(restored.close)
+            self.assertFalse(restored.busy)
+            self.assertFalse(restored.pending_candidates())
+            row = restored.list_candidates()[0]
+            self.assertEqual(row["state"], "discovered")
+            self.assertEqual(row["url"], pending[0]["url"])
+            self.assertEqual(restored.list_rounds()[0]["id"], round_id)
+            self.assertTrue(restored.list_events())
+            restored.request_download([row["id"]])
+            self.assertEqual(len(restored.pending_candidates()), 1)
+
+    def test_discovery_search_lock_blocks_export(self):
+        folder = self.root/"discovery"
+        folder.mkdir()
+        lock = _ProjectLock(folder/".worker.lock")
+        try:
+            with self.assertRaisesRegex(ValueError, "联网发现"):
                 portable.export_project(self.root, self.archive)
         finally:
             lock.close()

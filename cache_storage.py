@@ -172,6 +172,10 @@ def _prepare_location(root, target):
     return target
 
 
+class StorageBusy(ValueError):
+    """A transient project storage lease held by another operation."""
+
+
 @contextmanager
 def storage_lease(root):
     """Exclude migration/deletion from downloads, including other app instances."""
@@ -191,7 +195,7 @@ def storage_lease(root):
                 import fcntl
                 fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except OSError as exc:
-            raise ValueError("缓存正在下载或整理，请等待当前任务结束") from exc
+            raise StorageBusy("缓存正在下载或整理，请等待当前任务结束") from exc
         acquired = True
         yield
     finally:
@@ -440,9 +444,30 @@ def _switch_references(root, mappings, settings):
             raise
 
 
+@contextmanager
+def automatic_learning_idle(root):
+    """Exclude in-process automatic readers, including another app instance."""
+    from online_jobs import _ProjectLock
+    continuous = _ProjectLock(Path(root).resolve()/".continuous-learning.lock")
+    lock = None
+    try:
+        if continuous.fd is None:
+            raise ValueError("持续自动学习已启用，请停止后再整理缓存")
+        folder = Path(root).resolve()/"auto_learning"
+        folder.mkdir(parents=True,exist_ok=True)
+        lock = _ProjectLock(folder/".worker.lock")
+        if lock.fd is None:
+            raise ValueError("自动学习正在读取视频，请暂停并等待当前任务结束后再整理缓存")
+        yield
+    finally:
+        if lock is not None:
+            lock.close()
+        continuous.close()
+
+
 def change_location(root, target, *, migrate=False, report=lambda _:None):
     root = Path(root).resolve()
-    with storage_lease(root):
+    with storage_lease(root), automatic_learning_idle(root):
         ensure_no_active_workers(root)
         destination = _prepare_location(root,target)
         settings = {"version":1,"current":str(destination),"history":list(dict.fromkeys(
@@ -493,7 +518,7 @@ def change_location(root, target, *, migrate=False, report=lambda _:None):
 
 
 def remove_caches(root, paths, *, allow_referenced=False, report=lambda _:None):
-    with storage_lease(root):
+    with storage_lease(root), automatic_learning_idle(root):
         ensure_no_active_workers(root)
         folders = [_safe_folder(root,value) for value in dict.fromkeys(map(str,paths))]
         movies = _movies(root)

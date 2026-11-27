@@ -163,6 +163,7 @@ class OnlineVideoTests(unittest.TestCase):
         studio.learn_imported_movies = Mock(return_value=True)
         studio.import_online()
         workspace = studio.online_window
+        workspace.learning_kind.set("电影时序训练")
         studio.show_annotation()
         workspace.links.insert("1.0", self.base+"clip.mp4\n"+self.base+"index.html")
         workspace._add()
@@ -182,12 +183,172 @@ class OnlineVideoTests(unittest.TestCase):
         studio.learn_imported_movies.assert_called_once_with([movie["id"]],request_version=0)
         self.assertFalse(errors)
 
+    def test_workbench_default_auto_mode_downloads_analyzes_and_teaches_timing(self):
+        import tkinter as tk
+        from unittest.mock import Mock
+        from app import Studio
+        from auto_learning import load_reference
+        from scripts import import_script
+        import gc
+
+        gc.collect()
+        try:
+            window = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(str(exc))
+        window.withdraw()
+        errors = []
+        window.report_callback_exception = lambda cls, exc, tb: errors.append(str(exc))
+        studio = Studio(window)
+        def cleanup():
+            managers = [studio.online_manager, studio.auto_learning_manager]
+            studio.close_online_project()
+            deadline = time.monotonic()+10
+            while any(manager and manager.busy for manager in managers) and time.monotonic()<deadline:
+                time.sleep(.02)
+            for timer in window.tk.call("after", "info"):
+                window.after_cancel(timer)
+            window.destroy()
+        self.addCleanup(cleanup)
+        movie_id, _ = dataset.import_movie(self.root, self.media/"clip.mp4", "train", lambda _: None)
+        script = self.root/"timed.txt"
+        script.write_text("[00:00:00.000 --> 00:00:00.500] 小明：你好\n"
+                          "[00:00:00.500 --> 00:00:01.100] 小王：今天开始早睡\n"
+                          "[00:00:01.100 --> 00:00:01.900] 小明：明天一定\n", encoding="utf-8")
+        import_script(self.root, movie_id, script)
+        studio.use(self.root)
+        studio.learn_imported_movies = Mock(side_effect=AssertionError("automatic mode must not launch GRU"))
+        workspace = studio.online_window
+        self.assertEqual(workspace.learning_kind.get(), "自动编排学习（推荐）")
+        workspace.links.insert("1.0", self.base+"clip.mp4")
+        workspace._add()
+        deadline = time.monotonic()+45
+        jobs = []
+        while time.monotonic()<deadline:
+            window.update()
+            manager = studio.auto_learning_manager
+            if manager:
+                jobs = manager.list_jobs()
+                if jobs and jobs[0]["status"] in {"completed", "failed", "needs_input"} and not manager.busy:
+                    break
+            time.sleep(.02)
+        self.assertTrue(jobs, errors)
+        self.assertEqual(jobs[0]["status"], "completed", jobs)
+        self.assertEqual(jobs[0]["example_count"], 3)
+        self.assertTrue(Path(jobs[0]["board_path"]).is_file())
+        self.assertEqual(load_reference(self.root)["example_count"], 3)
+        self.assertFalse((self.root/"story_learning/director.json").exists())
+        self.assertTrue(studio.online_manager.list_jobs()[0]["learning_dispatched"])
+        studio.learn_imported_movies.assert_not_called()
+        self.assertFalse(errors)
+
     def test_finite_hls_and_live_manifest_rejection(self):
         result = online.import_online(self.root,self.base+"movie.m3u8","train",self.messages.append)
         self.assertTrue(Path(result["path"]).is_file())
         with self.assertRaisesRegex(ValueError,"直播|尚未结束"):
             online.import_online(self.root,self.base+"live.m3u8","train",self.messages.append)
         self.assertEqual(len(dataset.movies(self.root)),1)
+
+    def test_iqiyi_public_metadata_feeds_real_downloader_and_progress(self):
+        url = "https://www.iqiyi.com/v_fixture.html"
+        hint = {"site":"iqiyi", "url":url, "tvid":"12345", "vid":"a"*32,
+                "title":"公开喜剧短片", "duration":2}
+        folder = self.root/"iqiyi-attempt"
+        folder.mkdir()
+        raw = {"id":"a"*32, "title":hint["title"], "duration":2, "webpage_url":url,
+               "extractor":"iqiyi", "extractor_key":"Iqiyi",
+               "formats":[{"url":self.base+"clip.mp4", "format_id":"fixture", "height":64,
+                           "width":96, "ext":"mp4", "protocol":"http"}]}
+        events=[]
+        with patch("iqiyi_video.extract_public_video",return_value=raw) as extract:
+            result=online._download_impl({"url":url,"height":720,"subtitles":False,
+                "source_metadata":hint,"folder":str(folder)},self.messages.append,on_progress=events.append)
+        self.assertEqual(extract.call_args.args[1:],(url,hint))
+        self.assertEqual(result["title"],hint["title"])
+        self.assertEqual(Path(result["path"]).read_bytes(),(self.media/"clip.mp4").read_bytes())
+        self.assertTrue(any((row.get("downloaded_bytes") or 0)>0 for row in events))
+
+    def test_mismatched_search_metadata_is_rejected_before_download(self):
+        hint={"site":"iqiyi","url":"https://www.iqiyi.com/v_other.html", "tvid":"12345",
+              "vid":"a"*32, "duration":2, "title":"错误来源"}
+        with patch.object(online,"_run_download") as download:
+            with self.assertRaisesRegex(ValueError,"不匹配"):
+                online.import_online(self.root,"https://www.iqiyi.com/v_fixture.html","time",
+                                     self.messages.append,source_metadata=hint)
+        download.assert_not_called()
+
+    def test_search_metadata_updates_preserve_partial_download_and_use_latest_request(self):
+        url = "https://www.iqiyi.com/v_fixture.html"
+        core = {"url": url, "height": 720, "subtitles": False}
+        hint = {"site": "iqiyi", "url": url, "tvid": "12345", "vid": "a" * 32,
+                "duration": 10, "title": "原始标题"}
+        cases = [(hint, {**hint, "title": "更新标题"}), (hint, {**hint, "duration": 10.5}),
+                 (None, hint), (hint, None)]
+        for index, (before, after) in enumerate(cases):
+            with self.subTest(index=index):
+                folder = self.root / ("partial-" + str(index))
+                attempt = folder / "attempt-existing"
+                attempt.mkdir(parents=True)
+                partial = attempt / "media.mp4.part"
+                partial.write_bytes(b"already downloaded bytes")
+                previous = {**core, **({"source_metadata": before} if before is not None else {})}
+                current = {**core, **({"source_metadata": after} if after is not None else {})}
+                (folder / "pending.json").write_text(json.dumps({"config": previous, "attempt": attempt.name}), encoding="utf-8")
+                with patch.object(online, "_run_download", side_effect=RuntimeError("offline test stop")) as download:
+                    with self.assertRaisesRegex(RuntimeError, "offline test stop"):
+                        online._import_locked(self.root, folder, current, "time", self.messages.append, None, lambda _: None)
+                self.assertEqual(download.call_args.args[0], attempt)
+                self.assertEqual(download.call_args.args[1], {**current, "folder": str(attempt)})
+                self.assertEqual(partial.read_bytes(), b"already downloaded bytes")
+                self.assertEqual(len(list(folder.glob("attempt-*"))), 1)
+
+    def test_changed_playback_identity_or_download_options_start_new_partial_download(self):
+        url = "https://www.iqiyi.com/v_fixture.html"
+        hint = {"site": "iqiyi", "url": url, "tvid": "12345", "vid": "a" * 32,
+                "duration": 10, "title": "原始标题"}
+        original = {"url": url, "height": 720, "subtitles": False, "source_metadata": hint}
+        cases = [{**original, "source_metadata": {**hint, "tvid": "67890"}},
+                 {**original, "source_metadata": {**hint, "vid": "b" * 32}},
+                 {**original, "height": 480}, {**original, "subtitles": True}]
+        for index, current in enumerate(cases):
+            with self.subTest(index=index):
+                folder = self.root / ("changed-" + str(index))
+                attempt = folder / "attempt-existing"
+                attempt.mkdir(parents=True)
+                partial = attempt / "media.mp4.part"
+                partial.write_bytes(b"original media bytes")
+                (folder / "pending.json").write_text(json.dumps({"config": original, "attempt": attempt.name}), encoding="utf-8")
+                with patch.object(online, "_run_download", side_effect=RuntimeError("offline test stop")) as download:
+                    with self.assertRaisesRegex(RuntimeError, "offline test stop"):
+                        online._import_locked(self.root, folder, current, "time", self.messages.append, None, lambda _: None)
+                self.assertNotEqual(download.call_args.args[0], attempt)
+                self.assertEqual(download.call_args.args[1]["source_metadata"], current["source_metadata"])
+                self.assertEqual(partial.read_bytes(), b"original media bytes")
+                self.assertEqual(len(list(folder.glob("attempt-*"))), 2)
+
+    def test_new_playback_identity_is_remembered_across_metadata_free_retry(self):
+        url = "https://www.iqiyi.com/v_fixture.html"
+        core = {"url": url, "height": 720, "subtitles": False}
+        hint = {"site": "iqiyi", "url": url, "tvid": "12345", "vid": "a" * 32,
+                "duration": 10, "title": "公开短片"}
+        folder = self.root / "remembered-identity"
+        attempt = folder / "attempt-existing"
+        attempt.mkdir(parents=True)
+        (folder / "pending.json").write_text(json.dumps({"config": core, "attempt": attempt.name}), encoding="utf-8")
+        requests = [{**core, "source_metadata": hint}, core,
+                    {**core, "source_metadata": {**hint, "vid": "b" * 32}}]
+        actual = []
+        for current in requests:
+            with patch.object(online, "_run_download", side_effect=RuntimeError("offline test stop")) as download:
+                with self.assertRaisesRegex(RuntimeError, "offline test stop"):
+                    online._import_locked(self.root, folder, current, "time", self.messages.append, None, lambda _: None)
+            actual.append(download.call_args.args[0])
+        self.assertEqual(actual[:2], [attempt, attempt])
+        self.assertNotEqual(actual[2], attempt)
+
+    def test_real_site_restrictions_have_actionable_error_messages(self):
+        self.assertIn("限制",online._friendly_error("[youku] Youku server reported error -6004"))
+        self.assertIn("重新搜索",online._friendly_error("[iqiyi] Can't find any video"))
 
     def test_cancel_before_download_does_not_register_or_complete_and_can_retry(self):
         stop = threading.Event()

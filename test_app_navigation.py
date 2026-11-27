@@ -131,6 +131,26 @@ class AppNavigationTests(unittest.TestCase):
         self.assertTrue(self.studio.online_window.win.winfo_ismapped())
         self.assertFalse(any(isinstance(widget,tk.Toplevel) for widget in descendants(self.tk)))
 
+    def test_story_workspace_preserves_page_and_blocks_transfer_while_working(self):
+        self.navigate("story")
+        page = self.studio.story_window
+        self.assertIs(page.win.master,self.studio.page_area)
+        self.navigate("learn")
+        self.navigate("story")
+        self.assertIs(page,self.studio.story_window)
+        page.busy = True
+        try:
+            self.assertFalse(self.studio.transfer_ready())
+            self.assertFalse(self.studio.use(self.other))
+            self.studio.close()
+            self.assertFalse(self.studio.closing)
+            self.assertEqual(self.studio.root,self.root.resolve())
+        finally:
+            page.busy = False
+        self.assertTrue(self.studio.use(self.other))
+        self.assertFalse(page.win.winfo_exists())
+        self.assertIsNone(self.studio.story_window)
+
     def test_navigation_preserves_input_selection_pages_and_queue(self):
         identifier = self.completed_job()
         online = self.studio.online_window
@@ -151,6 +171,28 @@ class AppNavigationTests(unittest.TestCase):
         for key in ("library","training","cache"):
             self.navigate(key)
         self.assertEqual(pages,(self.studio.library_page,self.studio.training_window,self.studio.cache_window))
+
+    def test_automatic_task_window_opens_draft_and_closes_with_project(self):
+        from story_pipeline import generate_storyboard, save_storyboard
+        self.studio.show_auto_learning()
+        window = self.studio.auto_learning_window
+        manager = self.studio.auto_learning_manager
+        manager.pause()
+        manager.enqueue([1])
+        window.refresh_now()
+        self.tk.update()
+        self.assertEqual(len(window.tree.get_children()),1)
+        draft = self.root/"auto_learning/boards/reference.json"
+        save_storyboard(generate_storyboard("小明：今天开始早睡！", "自动参考草稿"),draft)
+        self.assertTrue(self.studio.open_auto_learning_board(draft))
+        self.tk.update()
+        self.assertEqual(self.studio.active_view,"story")
+        self.assertEqual(self.studio.story_window.board["title"],"自动参考草稿")
+        self.assertTrue(self.studio.use(self.other))
+        self.assertTrue(manager._closed)
+        self.assertFalse(window.win.winfo_exists())
+        self.assertIsNone(self.studio.auto_learning_window)
+        self.assertIsNone(self.studio.auto_learning_manager)
 
     def test_page_switch_keeps_an_active_download_running(self):
         manager = self.studio.online_manager
@@ -396,6 +438,29 @@ class AppNavigationTests(unittest.TestCase):
     def test_missing_detector_uses_movie_learning_without_person_detector(self):
         with patch.object(self.studio,"default_weight",return_value=str(self.root/'missing-detector.pt')):
             self.assertEqual(self.studio.movie_defaults()["weights"],"")
+
+    def test_builtin_video_analysis_entry_saves_only_settings_and_closes_with_project(self):
+        from video_analysis import load_settings
+        self.studio.show_auto_learning()
+        action = next(widget for widget in descendants(self.studio.auto_learning_window.win)
+                      if widget.winfo_class()=="TButton" and widget.cget("text")=="视频理解与笔记")
+        with patch("video_semantics.list_models",side_effect=AssertionError("opening settings must not connect")):
+            action.invoke()
+            self.tk.update()
+            view = self.studio.video_analysis_window
+            self.assertTrue(view.win.winfo_exists())
+            view.api_key.set("memory-only-test-key")
+            view.values["semantic_enabled"].set(True)
+            view.values["model"].set("fixture-model")
+            view._save()
+            self.assertEqual(load_settings(self.root)["model"],"fixture-model")
+            self.assertNotIn("memory-only-test-key",(self.root/"video_analysis_settings.json").read_text(encoding="utf-8"))
+            view.close()
+            self.studio.show_video_analysis()
+            self.assertEqual(self.studio.video_analysis_window.api_key.get(),"memory-only-test-key")
+            self.studio.use(self.other)
+            self.assertIsNone(self.studio.video_analysis_window)
+            self.assertEqual(self.studio.video_analysis_api_key,"")
 
     def test_portable_movie_detector_takes_precedence_over_newer_prediction_detector(self):
         latest = self.root/"runs"/"newer-detector"/"fit"/"weights"/"best.pt"

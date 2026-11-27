@@ -43,6 +43,8 @@ class MovieUsageIndex:
     def __init__(self,root,active=lambda:None):
         self.root,self.active = Path(root),active
         self.values = {}
+        self.ready = False
+        self.last_error = ""
         self.closed = threading.Event()
         self.worker = None
         self.next_read = 0.
@@ -56,8 +58,10 @@ class MovieUsageIndex:
                     values = learning_history(self.root,active=active,cancelled=self.closed)
                     if not self.closed.is_set():
                         self.values = values
-                except Exception:
-                    pass
+                        self.last_error = ""
+                        self.ready = True
+                except Exception as exc:
+                    self.last_error = str(exc)
             self.worker = threading.Thread(target=read,daemon=True,name="movie-usage-index")
             self.worker.start()
         return self.values

@@ -24,8 +24,8 @@ FORMAT = "aecpp-project"
 VERSION = 1
 MANIFEST = "manifest.json"
 VIDEOS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".m2ts", ".flv", ".wmv", ".mpeg", ".mpg"}
-DATABASES = {"annotations.sqlite", "online_jobs.sqlite"}
-TRANSIENT = {".cache-storage.lock", ".online_queue.lock", cache_storage.OWNER}
+DATABASES = {"annotations.sqlite", "online_jobs.sqlite", "auto_learning.sqlite", "discovery.sqlite", "learning_metrics.sqlite"}
+TRANSIENT = {".cache-storage.lock", ".online_queue.lock", ".worker.lock", ".continuous-learning.lock", cache_storage.OWNER}
 
 
 def _relative(value):
@@ -73,10 +73,30 @@ def _idle_project(root, is_busy):
         lock = _ProjectLock(root / ".online_queue.lock")
         if lock.fd is None:
             raise ValueError("在线视频队列仍在运行，请暂停并等待当前任务结束后再导出")
+        automatic = None
+        discovery = None
+        continuous = None
         try:
+            continuous = _ProjectLock(root / ".continuous-learning.lock")
+            if continuous.fd is None:
+                raise ValueError("持续自动学习仍已启用，请停止后再导出迁移包")
+            if (root / "auto_learning").is_dir():
+                automatic = _ProjectLock(root / "auto_learning" / ".worker.lock")
+                if automatic.fd is None:
+                    raise ValueError("自动学习仍在运行，请暂停并等待当前任务结束后再导出")
+            if (root / "discovery").is_dir():
+                discovery = _ProjectLock(root / "discovery" / ".worker.lock")
+                if discovery.fd is None:
+                    raise ValueError("联网发现仍在运行，请停止并等待搜索结束后再导出")
             check()
             yield check
         finally:
+            if continuous is not None:
+                continuous.close()
+            if discovery is not None:
+                discovery.close()
+            if automatic is not None:
+                automatic.close()
             lock.close()
 
 
@@ -416,6 +436,38 @@ def _relocate(staging, destination, manifest):
                     job.update(status="paused", phase="paused", control=None, message="已迁移到新电脑；确认后继续队列")
                 db.execute("UPDATE online_jobs SET data=?,status=? WHERE id=?", (json.dumps(job, ensure_ascii=False), job["status"], identifier))
             db.execute("INSERT OR REPLACE INTO online_meta VALUES('paused','1')")
+    automatic = staging / "auto_learning.sqlite"
+    if automatic.is_file():
+        with closing(sqlite3.connect(automatic)) as db, db:
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("自动学习队列数据库校验失败")
+            for identifier, payload in db.execute("SELECT id,data FROM jobs").fetchall():
+                job = replace(json.loads(payload))
+                if job.get("status") in {"running", "queued", "paused"}:
+                    job.update(status="paused", phase="paused", message="已迁移到新电脑；点击继续自动学习")
+                db.execute("UPDATE jobs SET data=?,status=? WHERE id=?",
+                           (json.dumps(job, ensure_ascii=False), job["status"], identifier))
+            db.execute("INSERT OR REPLACE INTO meta VALUES('paused','1')")
+    discovery = staging / "discovery.sqlite"
+    if discovery.is_file():
+        with closing(sqlite3.connect(discovery)) as db, db:
+            if db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("联网发现数据库校验失败")
+            for identifier, payload in db.execute("SELECT id,data FROM rounds").fetchall():
+                record = json.loads(payload)
+                record.update(auto_allowed=False, owner=None, message="已迁移联网发现记录；点击继续或手动选择后再下载学习")
+                if record.get("status") in {"searching", "paused", "stopped", "interrupted"}:
+                    record["status"] = "paused"
+                db.execute("UPDATE rounds SET data=?,status=? WHERE id=?",
+                           (json.dumps(record, ensure_ascii=False), record["status"], identifier))
+            for identifier, payload in db.execute("SELECT id,data FROM candidates").fetchall():
+                record = json.loads(payload)
+                record.update(manual_requested=False, manual_owner=None)
+                record.pop("claim_owner", None)
+                if record.get("state") == "dispatching":
+                    record.update(state="discovered", detail="已迁移，交接待恢复；请点击继续或手动选择")
+                db.execute("UPDATE candidates SET data=?,state=? WHERE id=?",
+                           (json.dumps(record, ensure_ascii=False), record["state"], identifier))
     # Cache metadata is mutable operational state; runs/ remains untouched.
     for path in (staging / "online_media").rglob("*.json"):
         try:

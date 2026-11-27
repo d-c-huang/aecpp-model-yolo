@@ -22,6 +22,11 @@ def wait_for(predicate, timeout=4):
     raise AssertionError("Timed out waiting for queue state")
 
 
+def iqiyi_metadata(url="https://www.iqiyi.com/v_fixture0.html"):
+    return {"site": "iqiyi", "url": url, "tvid": "123456789", "vid": "a" * 32,
+            "duration": 12.5, "title": "公开影片"}
+
+
 class OnlineJobsTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="yingge-online-queue-")
@@ -110,6 +115,175 @@ class OnlineJobsTests(unittest.TestCase):
         self.assertTrue(all(row["status"] == "completed" for row in manager.list_jobs()))
         self.assertEqual(2, next(row for row in manager.list_jobs() if row["id"] == ids[1])["attempts"])
         self.assertEqual(8, next(event for event in manager.drain_events() if event["type"] == "completed")["request_version"])
+
+    def test_learning_kind_is_frozen_and_legacy_identity_stays_compatible(self):
+        received = []
+        def importer(root, url, mode, report, *, height, subtitles, stop):
+            received.append((height, subtitles))
+            return self.import_ok(root, url, mode, report)
+        manager = self.manager(importer)
+        legacy_id = manager.add("https://example.com/film")["added"][0]
+        self.assertFalse(manager.add("https://example.com/film", learning_kind="movie-temporal")["added"])
+        automatic_id = manager.add("https://example.com/film", learning_kind="story-reference")["added"][0]
+        with self.assertRaises(ValueError):
+            manager.add("https://example.com/bad", learning_kind="unknown")
+        manager.start()
+        wait_for(lambda: not manager.busy)
+        rows = {row["id"]: row for row in manager.list_jobs()}
+        self.assertNotIn("learning_kind", rows[legacy_id]["config"])
+        self.assertEqual(rows[automatic_id]["config"]["learning_kind"], "story-reference")
+        self.assertEqual(len(received), 2)
+        previous = rows[automatic_id]
+        self.assertEqual(manager.acknowledge_learning([legacy_id, automatic_id]), [automatic_id])
+        self.assertEqual(manager.acknowledge_learning([automatic_id]), [])
+        current = next(row for row in manager.list_jobs() if row["id"] == automatic_id)
+        self.assertTrue(current["learning_dispatched"])
+        for key in ("status", "config", "fingerprint"):
+            self.assertEqual(current[key], previous[key])
+        manager.close()
+        reopened = self.manager()
+        self.assertTrue(next(row for row in reopened.list_jobs() if row["id"] == automatic_id)["learning_dispatched"])
+
+    def test_discovery_metadata_survives_reopen_and_reaches_explicit_importer(self):
+        received = []
+        def importer(root, url, mode, report, *, height, subtitles, stop, source_metadata):
+            received.append(source_metadata)
+            return self.import_ok(root, url, mode, report)
+        metadata = iqiyi_metadata()
+        manager = self.manager(importer)
+        job_id = manager.add(metadata["url"])["added"][0]
+        original = manager.list_jobs()[0]
+        manager.attach_discovery(job_id, {"id": "candidate-1", "round_id": "round-1", "continuous": True,
+                                          "video_metadata": metadata})
+        attached = manager.list_jobs()[0]
+        self.assertEqual(attached["discovery"]["video_metadata"], metadata)
+        self.assertTrue(attached["discovery"]["continuous"])
+        self.assertEqual(attached["fingerprint"], original["fingerprint"])
+        self.assertEqual(manager.add(metadata["url"])["duplicates"], [metadata["url"]])
+        manager.close()
+        reopened = self.manager(importer)
+        self.assertTrue(reopened.paused)
+        self.assertEqual(reopened.list_jobs()[0]["discovery"]["video_metadata"], metadata)
+        reopened.resume()
+        wait_for(lambda: not reopened.busy)
+        self.assertEqual(received, [metadata])
+        self.assertEqual(reopened.list_jobs()[0]["status"], "completed")
+
+    def test_discovery_metadata_whitelists_values_before_kwargs_importer(self):
+        received = []
+        def importer(root, url, mode, report, **kwargs):
+            received.append(kwargs.get("source_metadata"))
+            return self.import_ok(root, url, mode, report)
+        metadata = iqiyi_metadata()
+        manager = self.manager(importer)
+        job_id = manager.add(metadata["url"])["added"][0]
+        manager.attach_discovery(job_id, {"video_metadata": {**metadata, "exec": "untrusted command",
+                                                            "ydl_opts": {"exec_cmd": "untrusted command"}}})
+        self.assertEqual(manager.list_jobs()[0]["discovery"]["video_metadata"], metadata)
+        manager.start()
+        wait_for(lambda: not manager.busy)
+        self.assertEqual(received, [metadata])
+        self.assertEqual(manager.list_jobs()[0]["status"], "completed")
+
+    def test_discovery_metadata_preserves_legacy_importer_compatibility(self):
+        received = []
+        def importer(root, url, mode, report, *, height, subtitles, stop):
+            received.append(url)
+            return self.import_ok(root, url, mode, report)
+        metadata = iqiyi_metadata()
+        manager = self.manager(importer)
+        job_id = manager.add(metadata["url"])["added"][0]
+        manager.attach_discovery(job_id, {"video_metadata": metadata})
+        manager.start()
+        wait_for(lambda: not manager.busy)
+        self.assertEqual(received, [metadata["url"]])
+        row = manager.list_jobs()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertIn("使用原网页解析", row["log_tail"])
+
+    def test_absent_or_invalid_discovery_metadata_omits_importer_keyword(self):
+        received = []
+        def importer(root, url, mode, report, **kwargs):
+            received.append((url, "source_metadata" in kwargs))
+            return self.import_ok(root, url, mode, report)
+        metadata = iqiyi_metadata()
+        manager = self.manager(importer)
+        ids = manager.add(metadata["url"] + "\nhttps://www.iqiyi.com/v_other.html")["added"]
+        manager.attach_discovery(ids[0], {"id": "valid-without-metadata"})
+        manager.attach_discovery(ids[1], {"video_metadata": metadata})
+        rows = {row["id"]: row for row in manager.list_jobs()}
+        self.assertNotIn("video_metadata", rows[ids[1]]["discovery"])
+        self.assertIn("不匹配", rows[ids[1]]["discovery"]["metadata_warning"])
+        manager.start()
+        wait_for(lambda: not manager.busy)
+        self.assertEqual(len(received), 2)
+        self.assertTrue(all(not has_metadata for url, has_metadata in received))
+        self.assertTrue(all(row["status"] == "completed" for row in manager.list_jobs()))
+        invalid = next(row for row in manager.list_jobs() if row["id"] == ids[1])
+        self.assertIn("使用原网页解析", invalid["log_tail"])
+
+    def test_stored_discovery_metadata_is_revalidated_before_import(self):
+        received = []
+        def importer(root, url, mode, report, **kwargs):
+            received.append("source_metadata" in kwargs)
+            return self.import_ok(root, url, mode, report)
+        metadata = iqiyi_metadata()
+        manager = self.manager(importer)
+        job_id = manager.add(metadata["url"])["added"][0]
+        manager.attach_discovery(job_id, {"video_metadata": metadata})
+        manager.close()
+        with closing(sqlite3.connect(manager.db_path)) as db:
+            record = json.loads(db.execute("SELECT data FROM online_jobs WHERE id=?", (job_id,)).fetchone()[0])
+            record["discovery"]["video_metadata"]["vid"] = "invalid; arbitrary command"
+            db.execute("UPDATE online_jobs SET data=? WHERE id=?", (json.dumps(record), job_id))
+            db.commit()
+        reopened = self.manager(importer)
+        reopened.resume()
+        wait_for(lambda: not reopened.busy)
+        self.assertEqual(received, [False])
+        row = reopened.list_jobs()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertIn("vid 无效", row["log_tail"])
+
+    def test_cancel_learning_running_survives_completion_and_reopen(self):
+        entered, release = threading.Event(), threading.Event()
+        def importer(root, url, mode, report, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("Test release did not arrive")
+            return self.import_ok(root, url, mode, report)
+        manager = self.manager(importer)
+        job_id = manager.add("https://example.com/film", learning_kind="story-reference")["added"][0]
+        manager.start()
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(manager.cancel_learning([job_id]), [job_id])
+        self.assertEqual(manager.cancel_learning([job_id]), [])
+        release.set()
+        wait_for(lambda: not manager.busy)
+        row = manager.list_jobs()[0]
+        self.assertEqual(row["status"], "completed")
+        self.assertTrue(row["learning_cancelled"])
+        completion = next(event for event in manager.drain_events() if event["type"] == "completed")
+        self.assertFalse(completion["learn"])
+        manager.close()
+        reopened = self.manager()
+        self.assertTrue(reopened.list_jobs()[0]["learning_cancelled"])
+
+    def test_retry_reauthorizes_cancelled_learning_but_preserves_acknowledgement(self):
+        def importer(root, url, mode, report, **kwargs):
+            if url.endswith("bad"):
+                raise ValueError("temporary failure")
+            return self.import_ok(root, url, mode, report)
+        manager = self.manager(importer)
+        ids = manager.add("https://example.com/ok\nhttps://example.com/bad", learning_kind="story-reference")["added"]
+        manager.start()
+        wait_for(lambda: not manager.busy)
+        manager.acknowledge_learning([ids[0]])
+        manager.cancel_learning(ids)
+        manager.retry([ids[1]], request_version=9)
+        rows = {row["id"]: row for row in manager.list_jobs()}
+        self.assertTrue(rows[ids[0]]["learning_dispatched"])
+        self.assertTrue(all(not row.get("learning_cancelled") and row["request_version"] == 9 for row in rows.values()))
 
     def test_pause_resume_stops_current_and_retains_configuration(self):
         started = threading.Event()

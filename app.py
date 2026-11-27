@@ -100,11 +100,27 @@ class Studio:
         self.online_manager = None
         self.online_window = None
         self.retired_online_managers = []
+        self.auto_learning_manager = None
+        self.auto_learning_window = None
+        self.video_analysis_window = None
+        self.video_analysis_api_key = ""
+        self.retired_auto_learning_managers = []
+        self.discovery_manager = None
+        self.discovery_window = None
+        self.discovery_usage = None
+        self.retired_discovery_managers = []
+        self.discovery_activity = {}
+        self.continuous_learning_manager = None
+        self.continuous_models_ready = False
+        self.continuous_disk_paused = False
+        self.retired_continuous_managers = []
+        self.continuous_training_run = None
         self.online_learning_batches = {}
         self.online_refresh_pending = False
         self.online_poll_at = 0.
         self.cache_window = None
         self.library_page = None
+        self.story_window = None
         self.active_view = None
         self.profile_window = None
         self.profile_waiting = {}
@@ -160,6 +176,7 @@ class Studio:
         navigation.pack(fill="x")
         self.nav_buttons = {}
         for key,label,command in (("learn","自动学习",self.import_online),
+                                  ("story","小说成片",self.show_story),
                                   ("library","影片资源",self.show_library),
                                   ("training","训练中心",self.show_training),
                                   ("annotation","人工校正",self.show_annotation),
@@ -331,6 +348,614 @@ class Studio:
     def show_annotation(self):
         self.activate_page("annotation",self.annotation_page)
 
+    def show_story(self):
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        if self.story_window is None:
+            from story_window import StoryWindow
+            self.story_window = StoryWindow(self.win,self.root,container=self.page_area,
+                on_close=lambda:setattr(self,"story_window",None),
+                can_write=lambda:not self.storage_busy())
+        self.activate_page("story",self.story_window.win)
+
+    def story_busy(self):
+        return bool((getattr(self,"story_window",None) and self.story_window.busy) or
+                    (getattr(self,"learning_assembly_task",None) and self.learning_assembly_task.busy))
+
+    def get_auto_learning_manager(self):
+        if not self.root:
+            raise ValueError("请先打开工程")
+        if getattr(self,"auto_learning_manager",None) is None:
+            from auto_learning import AutoLearningManager
+            from video_analysis import analyse_video
+            self.auto_learning_manager = AutoLearningManager(self.root,
+                analyser=lambda root,movie,report,check:analyse_video(root,movie,report,check,
+                    api_key_provider=lambda:getattr(self,"video_analysis_api_key","")))
+        return self.auto_learning_manager
+
+    def show_auto_learning(self):
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        window = getattr(self,"auto_learning_window",None)
+        if window and window.win.winfo_exists():
+            window.show()
+            return
+        from auto_learning_window import AutoLearningWindow
+        self.auto_learning_window = AutoLearningWindow(self.win,self.get_auto_learning_manager(),
+            on_open_board=self.open_auto_learning_board,
+            on_import_helper=self.import_helper_transcript,
+            on_video_analysis=self.show_video_analysis,
+            on_dashboard=self.show_learning_dashboard,
+            continuous_status=self.continuous_learning_status,
+            on_close=lambda:setattr(self,"auto_learning_window",None),
+            can_write=lambda:not self.storage_busy() and not self.closing and not self.busy)
+
+    def show_learning_dashboard(self):
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        window = getattr(self,"learning_dashboard",None)
+        if window and window.win.winfo_exists():
+            window.show()
+            return
+        from learning_dashboard import LearningDashboard
+        controller = self.get_continuous_learning_manager()
+        if getattr(self,'learning_assembly_task',None) is None:
+            from story_assembly import AssemblyTask
+            self.learning_assembly_task=AssemblyTask(self.root);self.learning_assembly_task.restore()
+        self.learning_dashboard = LearningDashboard(self.win,self.root,runtime=controller.snapshot,
+            assembly_task=self.learning_assembly_task,
+            can_write=lambda:not self.storage_busy() and not self.closing and not self.busy and not self.project_transfer
+                and not (getattr(self,'story_window',None) and self.story_window.busy),
+            on_start=self.start_continuous_learning,on_stop=self.stop_continuous_learning,
+            on_jobs=self.show_auto_learning,on_sources=self.show_discovery,
+            on_close=lambda:setattr(self,"learning_dashboard",None))
+
+    def show_video_analysis(self,movie_id=None):
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        window = getattr(self,"video_analysis_window",None)
+        if window and window.win.winfo_exists():
+            window.show()
+            window.select_movie(movie_id)
+            return
+        from video_analysis_window import VideoAnalysisWindow
+        self.video_analysis_window = VideoAnalysisWindow(self.win,self.root,movie_id=movie_id,
+            on_close=lambda:setattr(self,"video_analysis_window",None),
+            can_write=lambda:not self.storage_busy() and not self.closing and not self.busy and not self._continuous_enabled(),
+            on_save=self.save_video_analysis_settings,on_test_models=self.test_video_analysis_models,
+            on_download_asr=self.download_speech_model,on_download_vision=self.download_vision_model,
+            on_open_board=self.open_analysis_board)
+        self.video_analysis_window.api_key.set(getattr(self,"video_analysis_api_key",""))
+
+    def save_video_analysis_settings(self,settings,key):
+        if self.closing or self.busy or self.storage_busy() or self._continuous_enabled():
+            return False
+        from video_analysis import save_settings
+        saved = save_settings(self.root,settings)
+        self.video_analysis_api_key = key
+        self.feed_status.set("视频理解设置已保存 · 后续任务使用新设置；历史影片可选择重新分析")
+        return saved
+
+    def _model_progress(self,event):
+        message = str(event.get("message","正在处理模型任务"))
+        percent = event.get("percent")
+        if isinstance(percent,(int,float)):
+            message += f" · {percent:.1f}%"
+        if event.get("url"):
+            message += " · "+str(event["url"])
+        if self.stop.is_set():
+            raise RuntimeError("模型任务已停止")
+        self.events.put(("video_model_status",message))
+
+    def test_video_analysis_models(self,settings,key):
+        if self.closing or self.busy or self.storage_busy() or self._continuous_enabled():
+            return False
+        from video_analysis import clean_settings
+        settings = clean_settings(settings)
+        root = self.root
+        def test():
+            from video_semantics import list_models
+            return list_models(base_url=settings["base_url"],provider=settings["provider"],
+                api_key=key or os.environ.get(settings["api_key_env"],""),report=self._model_progress,stop=self.stop)
+        def completed(names):
+            window = getattr(self,"video_analysis_window",None)
+            if not self.closing and self.root==root and window and window.win.winfo_exists():
+                window.set_models(names)
+            self.status.set(f"模型服务已连接 · {len(names)} 个可用模型")
+        self.start(test,completed)
+        return True
+
+    def download_speech_model(self,size):
+        if self.closing or self.busy or self.storage_busy() or self._continuous_enabled():
+            return False
+        root = self.root
+        def download():
+            from video_transcription import download_model
+            return str(download_model(size,BASE/"weights"/"asr",report=self._model_progress,stop=self.stop))
+        def completed(path):
+            window = getattr(self,"video_analysis_window",None)
+            if not self.closing and self.root==root and window and window.win.winfo_exists():
+                window.set_status(f"{size} 语音模型已就绪 · {path}；保存设置后可重新分析影片")
+            self.status.set(f"本地语音模型已就绪 · {path}")
+        self.start(download,completed)
+        return True
+
+    def download_vision_model(self,settings,key=""):
+        if self.closing or self.busy or self.storage_busy() or self._continuous_enabled():
+            return False
+        from video_analysis import clean_settings
+        settings = clean_settings(settings)
+        if settings["provider"]!="ollama":
+            raise ValueError("一键准备用于本机 Ollama；兼容接口请填写服务中已部署的视觉模型")
+        root = self.root
+        def download():
+            from video_model_setup import prepare_vision_model
+            return prepare_vision_model(base_url=settings["base_url"],report=self._model_progress,stop=self.stop)
+        def completed(name):
+            window = getattr(self,"video_analysis_window",None)
+            if not self.closing and self.root==root and window and window.win.winfo_exists():
+                window.values["visual_model"].set(name)
+                window.values["visual_enabled"].set(True)
+                window.set_status(f"视觉模型已就绪 · {name}；保存设置后重新分析影片")
+            self.status.set(f"本地视觉模型已就绪 · {name}")
+        self.start(download,completed)
+        return True
+
+    def open_analysis_board(self,note_path,block_ids=None):
+        if self.closing or self.busy or self.storage_busy():
+            return False
+        from video_analysis import write_json
+        from video_analysis_notes import load_reference,to_storyboard
+        note = load_reference(self.root,note_path)
+        board = to_storyboard(note,block_ids=block_ids)
+        path = self.root/"auto_learning"/"boards"/f"analysis-{note['movie_id']}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+        write_json(path,board)
+        return self.open_auto_learning_board(path)
+
+    def import_helper_transcript(self,movie_id):
+        if self.closing or self.busy or self.storage_busy():
+            return False
+        manager = self.get_auto_learning_manager()
+        job = next((row for row in manager.list_jobs() if row["movie_id"]==movie_id),None)
+        if not job:
+            raise ValueError("请先添加并选择对应影片的自动学习任务")
+        if job["status"] in {"running","queued","paused"}:
+            raise ValueError("请先完成或取消该影片的分析，再导入转写")
+        path = filedialog.askopenfilename(parent=self.win,
+            title=f"为《{job['title']}》选择 Video Helper 的 transcript.json",
+            filetypes=[("Video Helper 转写","*.json")])
+        if not path:
+            return False
+        root,version = self.root,self.training_cancel_version
+        def import_file():
+            from video_helper_import import import_transcript
+            return import_transcript(root,movie_id,path,report=self.progress)
+        def imported(result):
+            self.status.set(f"Video Helper 转写已导入 · {result['cue_count']} 条")
+            if not self.closing and self.root==root and self.training_cancel_version==version:
+                self.get_auto_learning_manager().enqueue([movie_id],force=True)
+                self.status.set(f"Video Helper 转写已导入 · {result['cue_count']} 条；已提交重新分析")
+        self.start(import_file,imported)
+        return True
+
+    def open_auto_learning_board(self,path):
+        if self.storage_busy() or self.closing:
+            return False
+        path = Path(path)
+        if not path.is_absolute():
+            path = self.root/path
+        if not path.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError("自动学习草稿不在当前工程中，请重新分析")
+        self.show_story()
+        return self.story_window.open_board(path)
+
+    def learn_auto_movies(self,movie_ids,*,request_version=None,show_panel=False):
+        if self.closing or not self.root:
+            return False
+        if self.storage_busy():
+            self.feed_status.set("缓存管理或工程迁移正在执行，完成后可继续自动学习")
+            return False
+        if request_version is not None and request_version!=self.training_cancel_version:
+            self.feed_status.set("视频已导入 · 自动学习已取消")
+            return False
+        ids = list(dict.fromkeys(movie_ids))
+        if not ids:
+            return False
+        jobs = self.get_auto_learning_manager().enqueue(ids)
+        self.feed_status.set(f"自动编排学习 · 已提交 {len(jobs)} 个视频任务；在自动学习任务中查看进度")
+        if show_panel:
+            self.show_auto_learning()
+        return True
+
+    def poll_auto_learning(self):
+        self.retired_auto_learning_managers = [manager for manager in
+            getattr(self,"retired_auto_learning_managers",[]) if manager.busy]
+        manager = getattr(self,"auto_learning_manager",None)
+        if manager is None:
+            return
+        if time.monotonic()-getattr(self,"auto_learning_wake_at",0) >= .5:
+            self.auto_learning_wake_at = time.monotonic()
+            manager.wake()
+        for event in manager.drain_events():
+            if not self.closing and event.get("message"):
+                self.feed_status.set("自动学习 · "+event["message"])
+            window = getattr(self,"video_analysis_window",None)
+            if window and event.get("status") in {"completed","partial"} and window.win.winfo_exists():
+                window.refresh_notes()
+
+    def get_discovery_manager(self):
+        if not self.root:
+            raise ValueError("请先打开工程")
+        if getattr(self,"discovery_manager",None) is None:
+            from discovery_learning import DiscoveryManager
+            self.discovery_manager = DiscoveryManager(self.root)
+        return self.discovery_manager
+
+    def get_continuous_learning_manager(self):
+        if not self.root:
+            raise ValueError("请先打开工程")
+        if getattr(self,"continuous_learning_manager",None) is None:
+            from continuous_learning import ContinuousLearningManager
+            self.continuous_learning_manager = ContinuousLearningManager(self.root,self.get_discovery_manager())
+        return self.continuous_learning_manager
+
+    def _continuous_enabled(self):
+        manager = getattr(self,"continuous_learning_manager",None)
+        return bool(manager and manager.active)
+
+    def continuous_learning_status(self):
+        if not self.root:
+            return {"active":False,"state":"idle","message":"打开工程后即可一键启动自动学习",
+                    "totals":{"ready":False,"message":"打开工程后统计学习成果"}}
+        manager = self.get_continuous_learning_manager()
+        snapshot = manager.snapshot()
+        if manager.active and getattr(self,"continuous_disk_paused",False):
+            snapshot.update(state="disk-low",phase="disk-low",message="缓存磁盘空间不足，下载与新增查找已暂停；腾出空间后自动继续")
+        return {**snapshot,**getattr(self,"discovery_activity",{}),"totals":self._learning_totals()}
+
+    def _learning_totals(self, *, force=False):
+        """Small, read-only durable snapshots shared by all learning windows."""
+        import sqlite3
+        from learning_totals import summarize_learning
+        root, now = Path(self.root).resolve(), time.monotonic()
+        previous = getattr(self,"learning_totals_cache",None)
+        same_project = getattr(self,"learning_totals_root",None)==root
+        if same_project and previous is not None and not force and now-getattr(self,"learning_totals_at",0)<2:
+            return previous
+        def read(filename, table, *, raw=False):
+            path = root/filename
+            if not path.is_file():
+                return []
+            # Looking at cumulative results never constructs/resumes a worker.
+            db = sqlite3.connect(path.as_uri()+"?mode=ro",uri=True,timeout=.1)
+            try:
+                db.row_factory = sqlite3.Row
+                columns = "*" if raw else "data"
+                rows = db.execute(f"SELECT {columns} FROM {table}").fetchall()
+                return [dict(row) if raw else json.loads(row["data"]) for row in rows]
+            finally:
+                db.close()
+        try:
+            totals = summarize_learning(read("online_jobs.sqlite","online_jobs"),
+                read("auto_learning.sqlite","jobs"),read("discovery.sqlite","candidates"),
+                movies=read("annotations.sqlite","movies",raw=True))
+        except (OSError,ValueError,sqlite3.Error) as exc:
+            # A briefly locked database affects the display only, never the
+            # automatic pipeline. Keep the last observed counters labelled stale.
+            totals = {**(previous if same_project and previous else {}),"ready":False,
+                      "message":"累计成果暂未刷新，稍后自动重试："+str(exc)[:250]}
+        self.learning_totals_root, self.learning_totals_at, self.learning_totals_cache = root,now,totals
+        return totals
+
+    def start_continuous_learning(self):
+        if self.closing or self.busy or self.storage_busy():
+            self.status.set("请等待当前任务完成后启动自动学习")
+            return False
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        manager = self.get_continuous_learning_manager()
+        if manager.active:
+            self.show_learning_dashboard()
+            return True
+        self.continuous_models_ready = False
+        self.continuous_disk_paused = False
+        manager.start()
+        self.show_learning_dashboard()
+        self.feed_status.set("正在自动配置本地模型；完成后持续查找、下载和学习三站视频")
+        return True
+
+    def stop_continuous_learning(self):
+        errors = []
+        def attempt(label,action):
+            try:
+                return action()
+            except Exception as exc:
+                errors.append(f"{label}：{exc}")
+        manager = getattr(self,"continuous_learning_manager",None)
+        if manager is not None:
+            attempt("停止查找",manager.stop)
+        self.continuous_models_ready = False
+        self.continuous_disk_paused = False
+        online = getattr(self,"online_manager",None)
+        if online is not None:
+            attempt("暂停下载",online.pause)
+        automatic = getattr(self,"auto_learning_manager",None)
+        if automatic is not None:
+            attempt("暂停分析",automatic.pause)
+        # Cancel this mode's pending training handoffs, leaving unrelated model
+        # training alone. Its completed video files and learning outputs remain.
+        rows = (attempt("读取下载记录",online.list_jobs) or []) if online else []
+        for key in list(getattr(self,"online_learning_batches",{})):
+            batch = key[0]
+            if any(row["batch_id"]==batch and (row.get("discovery") or {}).get("continuous") for row in rows):
+                self.online_learning_batches.pop(key,None)
+        pending = getattr(self,"pending_movie_learning",None)
+        if pending and pending[0].get("_continuous"):
+            self.pending_movie_learning = None
+        if (getattr(self,"feed_movie_settings",None) or {}).get("_continuous"):
+            self.feed_pending = False
+            self.feed_snapshot = None
+            self.feed_movie_settings = None
+        if self.training and self.training[3].name==getattr(self,"continuous_training_run",None):
+            self.continuous_training_stop = True
+            self.training_stop.set()
+            self.training_status.set("正在停止自动电影训练；已有成果保留")
+        message = ("停止请求已发送，部分状态需检查："+"；".join(errors) if errors else
+                   "持续自动学习已停止；下载与分析已暂停，缓存和已学成果保留")
+        self.feed_status.set(message)
+        if errors:
+            self.status.set(message)
+        return not errors
+
+    def _continuous_handoff_allowed(self,row):
+        if not (row.get("discovery") or {}).get("continuous"):
+            return True
+        manager = getattr(self,"continuous_learning_manager",None)
+        return bool(manager and manager.active and getattr(self,"continuous_models_ready",False))
+
+    def poll_continuous_learning(self):
+        retired = []
+        for previous in getattr(self,"retired_continuous_managers",[]):
+            previous.tick()
+            if previous.busy:
+                retired.append(previous)
+        self.retired_continuous_managers = retired
+        manager = getattr(self,"continuous_learning_manager",None)
+        if manager is None or self.closing:
+            return
+        now = time.monotonic()
+        if now-getattr(self,"continuous_poll_at",0)<.5:
+            return
+        self.continuous_poll_at = now
+        if not manager.active:
+            manager.tick()
+            return
+        online,automatic = getattr(self,"online_manager",None),getattr(self,"auto_learning_manager",None)
+        downloads = online.list_jobs() if online else []
+        analyses = automatic.list_jobs() if automatic else []
+        from cache_storage import get_settings
+        import shutil
+        cache = Path(get_settings(self.root)["current"])
+        while not cache.exists() and cache != cache.parent:
+            cache = cache.parent
+        workload = {"pending_downloads":sum(row["status"] in {"queued","running","paused"} for row in downloads),
+                    "pending_learning":sum(row["status"] in {"queued","running","paused"} for row in analyses),
+                    "training_busy":bool(self.training or self.pending_movie_learning),
+                    "free_bytes":shutil.disk_usage(cache).free,
+                    "paused":self.storage_busy() or bool(online and online.paused) or bool(automatic and automatic.paused)}
+        if manager.active and getattr(self,"continuous_models_ready",False) and online:
+            low_space = workload["free_bytes"] < manager.get_config()["min_free_gib"]*1024**3
+            if low_space and not online.paused:
+                online.pause()
+                self.continuous_disk_paused = True
+            elif not low_space and getattr(self,"continuous_disk_paused",False):
+                online.resume(request_version=self.training_cancel_version)
+                self.continuous_disk_paused = False
+            workload["paused"] = self.storage_busy() or online.paused or bool(automatic and automatic.paused)
+        manager.tick(workload=workload)
+        for event in manager.drain_events():
+            if event.get("type")=="models-ready" and manager.active:
+                # Resume only after model readiness, including durable completed
+                # downloads whose downstream handoff was paused before exit.
+                if self.online_manager is None:
+                    from online_jobs import OnlineJobManager
+                    self.online_manager = OnlineJobManager(self.root)
+                self.online_manager.migrate_restricted_jobs()
+                self.online_manager.resume(request_version=self.training_cancel_version)
+                automatic = self.get_auto_learning_manager()
+                automatic.resume()
+                completed = [row for row in self.online_manager.list_jobs()
+                    if (row.get("discovery") or {}).get("continuous") and row["status"]=="completed"]
+                refs = {row["movie_id"]:row for row in automatic.list_jobs()}
+                retry_movies = []
+                for row in completed:
+                    movie_id = (row.get("result") or {}).get("movie_id")
+                    reference = refs.get(movie_id,{})
+                    if reference.get("status") in {"needs_input","partial","failed","cancelled"}:
+                        retry_movies.append(movie_id)
+                if retry_movies:
+                    automatic.enqueue(retry_movies,force=True)
+                self.online_manager.request_learning([row["id"] for row in completed],request_version=self.training_cancel_version)
+                self.auto_learning_recovery_pending = True
+                self.continuous_models_ready = True
+                self.video_analysis_api_key = ""
+            if event.get("message"):
+                self.feed_status.set("持续学习 · "+str(event["message"]))
+
+    def show_discovery(self):
+        if not self.root:
+            self.use(Path.home()/"映格工程"/"默认工程")
+        window = getattr(self,"discovery_window",None)
+        if window and window.win.winfo_exists():
+            window.show()
+            return
+        from discovery_window import DiscoveryWindow
+        self.discovery_window = DiscoveryWindow(self.win,self.get_discovery_manager(),
+            on_dashboard=self.show_learning_dashboard,
+            on_close=lambda:setattr(self,"discovery_window",None),
+            on_open_learning=self.show_auto_learning,
+            on_queue_selected=self.queue_discovered,
+            can_write=lambda:not self.storage_busy() and not self.closing,
+            activity=lambda:getattr(self,"discovery_activity",{}),
+            on_start_continuous=self.start_continuous_learning,on_stop_continuous=self.stop_continuous_learning,
+            continuous_status=self.continuous_learning_status)
+
+    def queue_discovered(self,ids):
+        if self.storage_busy() or self.closing:
+            return False
+        self.get_discovery_manager().request_download(ids)
+        self.discovery_poll_at = 0.
+        self.poll_discovery()
+        return True
+
+    def temporal_learning_states(self):
+        """Combine saved outcomes with this process's actual active/pending jobs."""
+        from movie_usage import MovieUsageIndex
+        if getattr(self,"discovery_usage",None) is None:
+            self.discovery_usage = MovieUsageIndex(self.root,
+                active=lambda:self.training[3].name if self.training else None)
+        states = {identifier:{"status":value["last_state"],"run":value["last_run"],
+                              "message":{"completed":"电影时序训练完成", "failed":"训练失败，请查看训练日志",
+                                         "stopped":"训练已停止", "unfinished":"上次训练未完成"}.get(value["last_state"],value["last_state"])}
+                  for identifier,value in self.discovery_usage.snapshot().items()}
+        if self.training and self.training_kind=="movie-temporal":
+            run = self.training[3]
+            job = read_json(self.root/"logs"/(run.name+"-train.json"))
+            for identifier in job.get("movie_ids",[]):
+                states[identifier] = {"status":"running","run":run.name,"message":self.training_status.get()}
+        snapshots = []
+        pending = getattr(self,"pending_movie_learning",None)
+        if pending:
+            snapshots.append(pending[1])
+        if getattr(self,"feed_pending",False) and self.training_kind=="movie-temporal":
+            snapshots.append(getattr(self,"feed_snapshot",None))
+        for snapshot in snapshots:
+            for movie in (snapshot or {}).get("movies",[]):
+                states[movie["id"]] = {"status":"queued","message":"等待当前训练轮次结束后学习"}
+        return states
+
+    def learn_discovered_movies(self,ids,*,request_version):
+        if not self.learn_auto_movies(ids,request_version=request_version):
+            return False
+        states = self.temporal_learning_states()
+        usage = getattr(self,"discovery_usage",None)
+        if usage is not None and not usage.ready:
+            self.feed_status.set("正在读取已有电影学习记录…" + (" · "+usage.last_error if usage.last_error else ""))
+            return False
+        if usage is not None:
+            # ready is published after values; reread in case the first scan
+            # finished between the preceding snapshot and the readiness check.
+            states = self.temporal_learning_states()
+        remaining = [identifier for identifier in ids if states.get(identifier,{}).get("status")
+                     not in {"running","queued","completed"}]
+        if not remaining:
+            return True
+        cfg = dict(self.movie_training_settings or self.movie_defaults())
+        cfg["movie_ids"] = remaining
+        # Unconfirmed actors/story are omitted by snapshot_sources. Automatic
+        # observation can train without pretending those optional facts are reviewed.
+        return self.submit_movie_config(cfg,merge_pending=True,purpose="discovery-auto",review_profiles=False) is True
+
+    def poll_discovery(self):
+        self.retired_discovery_managers = [manager for manager in
+            getattr(self,"retired_discovery_managers",[]) if manager.busy]
+        manager = getattr(self,"discovery_manager",None)
+        if manager is None or self.closing:
+            return
+        now = time.monotonic()
+        if now-getattr(self,"discovery_poll_at",0)<.5:
+            return
+        self.discovery_poll_at = now
+        if not self.storage_busy():
+            from discovery_learning import video_site
+            from online_jobs import OnlineJobManager
+            for candidate in manager.pending_candidates():
+                added = []
+                try:
+                    video_site(candidate["url"])
+                    if self.online_manager is None:
+                        self.online_manager = OnlineJobManager(self.root)
+                        self.auto_learning_recovery_pending = True
+                    online = self.online_manager
+                    kind = "story-and-movie" if candidate["category"]=="movie" else "story-reference"
+                    result = online.add(candidate["url"],mode="time",height=720,subtitles=True,
+                                        learn=True,learning_kind=kind,request_version=self.training_cancel_version)
+                    added = result["added"]
+                    if result["errors"]:
+                        raise ValueError(result["errors"][0]["message"])
+                    jobs = online.list_jobs()
+                    job = next((row for row in jobs if row["id"] in added),None)
+                    if job is None:
+                        job = next((row for row in jobs if row["url"]==candidate["url"] and
+                            row.get("learning_kind",row.get("config",{}).get("learning_kind"))==kind and
+                            row.get("config",{}).get("height")==720 and row.get("config",{}).get("mode")=="time" and
+                            row.get("config",{}).get("subtitles") and row.get("config",{}).get("learn")),None)
+                    if job is None:
+                        raise ValueError("无法关联下载记录，请在下载队列中检查")
+                    continuous = getattr(self,"continuous_learning_manager",None)
+                    owned = continuous.snapshot().get("owned_round_ids",[]) if continuous else []
+                    online.attach_discovery(job["id"],{**candidate,
+                        "continuous":candidate["round_id"] in owned and not candidate.get("manual_requested")})
+                    accepted = manager.ack_candidate(candidate["id"],job["id"],learning_kind=kind)
+                    if not accepted:
+                        if added:
+                            online.cancel(added)
+                        continue
+                    if job["status"] in {"failed","cancelled","skipped"} and candidate.get("manual_requested"):
+                        online.retry([job["id"]],request_version=self.training_cancel_version)
+                    if job["status"]=="completed" and candidate.get("manual_requested"):
+                        movie_id = (job.get("result") or {}).get("movie_id")
+                        if movie_id is not None:
+                            automatic = self.get_auto_learning_manager()
+                            reference = next((row for row in automatic.list_jobs() if row["movie_id"]==movie_id),{})
+                            if reference.get("status") in {"failed","needs_input","cancelled"}:
+                                automatic.enqueue([movie_id],force=True)
+                        online.request_learning([job["id"]],request_version=self.training_cancel_version)
+                        self.auto_learning_recovery_pending = True
+                    if job["status"]=="completed" and not job.get("learning_dispatched"):
+                        self.auto_learning_recovery_pending = True
+                    # An already paused queue stays paused until its own Continue action.
+                    if not online.paused:
+                        online.start()
+                except Exception as exc:
+                    if added and self.online_manager is not None:
+                        self.online_manager.cancel(added)
+                    manager.set_candidate_state(candidate["id"],"failed",str(exc))
+        candidates = manager.list_candidates()
+        linked = [row for row in candidates if row.get("online_job_id") and row["state"] not in {"discovered","dispatching"}]
+        downloads, learning = [], []
+        if linked:
+            from discovery_status import candidate_status
+            if self.online_manager is None:
+                from online_jobs import OnlineJobManager
+                self.online_manager = OnlineJobManager(self.root)
+                self.auto_learning_recovery_pending = True
+            jobs = {row["id"]:row for row in self.online_manager.list_jobs()}
+            references = {row["movie_id"]:row for row in self.get_auto_learning_manager().list_jobs()}
+            temporal = self.temporal_learning_states() if any(row.get("learning_kind")=="story-and-movie" for row in linked) else {}
+            for candidate in linked:
+                job = jobs.get(candidate["online_job_id"])
+                movie_id = ((job or {}).get("result") or {}).get("movie_id")
+                update = candidate_status(candidate,job,references.get(movie_id),temporal.get(movie_id))
+                changed = manager.set_candidate_state(candidate["id"],**update)
+                continuous = getattr(self,"continuous_learning_manager",None)
+                if changed and job and (job.get("discovery") or {}).get("continuous") and continuous:
+                    if update["state"]=="skipped":
+                        continuous.notify_skipped(job["id"],site=candidate.get("site",""),
+                            reason=update["detail"],title=job.get("title") or candidate["title"],url=candidate["url"])
+                    elif job["status"]=="completed" and candidate.get("movie_id") is None:
+                        continuous.notify_download_success(site=candidate.get("site",""))
+                active = {**update,"title":(job or {}).get("title") or candidate["title"],
+                          "source_url":candidate["url"],"message":update["detail"],"percent":update.get("progress")}
+                if update["state"]=="downloading":
+                    downloads.append(active)
+                elif update["state"]=="learning":
+                    learning.append(active)
+        self.discovery_activity = {"current_downloads":downloads,"current_learning":learning}
+        for event in manager.drain_events():
+            if event.get("message"):
+                self.feed_status.set("联网学习 · "+event["message"])
+
     def undo_key(self,event=None):
         if self.active_view=="annotation" and self.win.focus_get() in (self.canvas,self.tree):
             self.undo()
@@ -375,8 +1000,10 @@ class Studio:
             self.use(Path(path))
 
     def transfer_ready(self):
-        if self.busy or self.training or self.online_active() or self.storage_busy():
+        if self.busy or self.training or self.online_active() or self.storage_busy() or self.story_busy():
             self.status.set("请等当前任务完成，并停止后台学习和下载后再迁移工程")
+            return False
+        if getattr(self,"story_window",None) and not self.story_window.save_current():
             return False
         if self.profile_window and self.profile_window.win.winfo_exists():
             if self.profile_window.close() is False:
@@ -450,13 +1077,13 @@ class Studio:
         return "\n".join(notes)
 
     def use(self,path):
-        if self.busy or self.training:
+        if self.busy or self.training or self.story_busy():
             self.status.set("请等待当前任务完成后再切换工程")
             return False
         if self.storage_busy():
             self.status.set("缓存管理正在执行，请完成后再切换工程")
             return False
-        for name in ("profile_window","cache_window"):
+        for name in ("story_window","profile_window","cache_window"):
             window = getattr(self,name,None)
             if window and window.win.winfo_exists():
                 if window.close() is False:
@@ -919,14 +1546,33 @@ class Studio:
 
     def poll(self):
         try:
+            self.poll_continuous_learning()
+        except Exception as exc:
+            self.stop_continuous_learning()
+            self.status.set(f"持续自动学习已暂停 · {exc}")
+        try:
+            self.poll_discovery()
+        except Exception as exc:
+            self.status.set(f"联网学习任务消息 · {exc}")
+        try:
             self.poll_online()
         except Exception as exc:
             self.status.set(f"在线视频任务消息 · {exc}")
+        try:
+            self.poll_auto_learning()
+        except Exception as exc:
+            self.status.set(f"自动学习任务消息 · {exc}")
         if getattr(self,"profile_waiting",None) and time.monotonic()-getattr(self,"profile_poll_at",0)>.7:
             self.profile_poll_at = time.monotonic()
             self.resume_profile_learning()
         while not self.events.empty():
             kind,msg = self.events.get_nowait()
+            if kind=="video_model_status":
+                self.status.set(msg)
+                window = getattr(self,"video_analysis_window",None)
+                if window and window.win.winfo_exists():
+                    window.set_status(msg)
+                continue
             if kind.startswith("train_"):
                 try:
                     self.poll_training(kind,msg)
@@ -1008,12 +1654,19 @@ class Studio:
         from online_window import OnlineWindow
         if self.online_manager is None:
             self.online_manager = OnlineJobManager(self.root)
+            self.auto_learning_recovery_pending = True
         self.online_window = OnlineWindow(
             self.win,self.online_manager,on_open_movie=self.open_online_movie,
             on_learn=lambda ids:self.learn_imported_movies(ids,selected_only=True),
             on_open_training=self.show_training,on_close=lambda:setattr(self,"online_window",None),
             request_version=lambda:self.training_cancel_version,
             on_cache=self.show_cache,on_profiles=self.show_movie_profiles,
+            on_auto_learning=self.show_auto_learning,
+            on_discovery=self.show_discovery,
+            on_dashboard=self.show_learning_dashboard,
+            on_start_continuous=self.start_continuous_learning,on_stop_continuous=self.stop_continuous_learning,
+            continuous_status=self.continuous_learning_status,
+            on_auto_learn=lambda ids:self.learn_auto_movies(ids,show_panel=True),
             on_learning_settings=self.configure_online_learning,can_download=lambda:not self.storage_busy(),
             active_training=lambda:self.training[3].name if self.training else None,container=self.page_area)
         self.activate_page("learn",self.online_window.win)
@@ -1058,11 +1711,17 @@ class Studio:
     @staticmethod
     def movie_options(cfg):
         return {"patience":cfg.get("patience",5),"learning_rate":cfg.get("learning_rate",.001),
-                "restart":cfg.get("restart",False)}
+                "restart":cfg.get("restart",False),
+                **({"continuous":bool(cfg["_continuous"])} if "_continuous" in cfg else {})}
 
     def configure_online_learning(self):
         if not self.root or self.storage_busy():
             return False
+        window = getattr(self,"online_window",None)
+        choice = getattr(window,"learning_kind",None)
+        if choice is not None and choice.get()=="自动编排学习（推荐）":
+            self.show_auto_learning()
+            return True
         from training_setup import training_setup
         current = self.movies.get(self.movie_picker.get())
         cfg = training_setup(self.win,dataset.movies(self.root),current["id"] if current else None,
@@ -1137,9 +1796,70 @@ class Studio:
 
     def online_active(self):
         managers = [getattr(self,"online_manager",None),*getattr(self,"retired_online_managers",[])]
-        return any(manager is not None and manager.busy for manager in managers)
+        managers.extend([getattr(self,"auto_learning_manager",None),
+                         *getattr(self,"retired_auto_learning_managers",[])])
+        managers.extend([getattr(self,"discovery_manager",None),
+                         *getattr(self,"retired_discovery_managers",[])])
+        continuous = [getattr(self,"continuous_learning_manager",None),
+                      *getattr(self,"retired_continuous_managers",[])]
+        return (any(manager is not None and manager.busy for manager in managers) or
+                any(manager is not None and (manager.active or manager.busy) for manager in continuous))
 
     def close_online_project(self):
+        dashboard = getattr(self,"learning_dashboard",None)
+        if dashboard and dashboard.win.winfo_exists():
+            dashboard.close()
+        self.learning_dashboard = None
+        task=getattr(self,'learning_assembly_task',None)
+        if task and task.busy:task.cancel()
+        self.learning_assembly_task=None
+        continuous = getattr(self,"continuous_learning_manager",None)
+        if continuous is not None:
+            continuous.close()
+            if not hasattr(self,"retired_continuous_managers"):
+                self.retired_continuous_managers = []
+            self.retired_continuous_managers.append(continuous)
+        self.continuous_learning_manager = None
+        self.continuous_models_ready = False
+        self.continuous_disk_paused = False
+        self.continuous_training_run = None
+        self.continuous_poll_at = 0.
+        self.learning_totals_cache = None
+        self.learning_totals_root = None
+        self.learning_totals_at = 0.
+        model_window = getattr(self,"video_analysis_window",None)
+        if model_window and model_window.win.winfo_exists():
+            model_window.close()
+        self.video_analysis_window = None
+        self.video_analysis_api_key = ""
+        discovery_window = getattr(self,"discovery_window",None)
+        if discovery_window and discovery_window.win.winfo_exists():
+            discovery_window.close()
+        self.discovery_window = None
+        discovery_manager = getattr(self,"discovery_manager",None)
+        if discovery_manager is not None:
+            discovery_manager.close()
+            if not hasattr(self,"retired_discovery_managers"):
+                self.retired_discovery_managers = []
+            self.retired_discovery_managers.append(discovery_manager)
+        self.discovery_manager = None
+        usage = getattr(self,"discovery_usage",None)
+        if usage:
+            usage.close()
+        self.discovery_usage = None
+        self.discovery_activity = {}
+        self.discovery_poll_at = 0.
+        auto_window = getattr(self,"auto_learning_window",None)
+        if auto_window and auto_window.win.winfo_exists():
+            auto_window.close()
+        self.auto_learning_window = None
+        auto_manager = getattr(self,"auto_learning_manager",None)
+        if auto_manager is not None:
+            auto_manager.close()
+            if not hasattr(self,"retired_auto_learning_managers"):
+                self.retired_auto_learning_managers = []
+            self.retired_auto_learning_managers.append(auto_manager)
+        self.auto_learning_manager = None
         window = getattr(self,"online_window",None)
         if window and window.win.winfo_exists():
             window.close()
@@ -1150,6 +1870,8 @@ class Studio:
             self.retired_online_managers.append(manager)
         self.online_manager = None
         self.online_learning_batches = {}
+        self.auto_learning_recovery_pending = False
+        self.auto_handoff_retries = {}
         self.online_refresh_pending = False
         self.online_poll_at = 0.
         if hasattr(self,"online_button"):
@@ -1166,6 +1888,19 @@ class Studio:
         self.online_poll_at = now
         rows = manager.list_jobs()
         by_id = {row["id"]:row for row in rows}
+        # Recover only the new workflow's unacknowledged durable handoffs. Old
+        # movie jobs retain their original event-driven behavior.
+        if getattr(self,"auto_learning_recovery_pending",False) and not self.closing:
+            self.auto_learning_recovery_pending = False
+            for row in rows:
+                kind = row.get("learning_kind",row.get("config",{}).get("learning_kind","movie-temporal"))
+                if (kind in {"story-reference","story-and-movie"} and row["status"]=="completed" and
+                        self._continuous_handoff_allowed(row) and
+                        row.get("learn",row.get("config",{}).get("learn")) and
+                        not row.get("learning_dispatched") and not row.get("learning_cancelled") and
+                        row.get("result",{}).get("movie_id") is not None):
+                    key = (row["batch_id"],self.training_cancel_version,kind)
+                    self.online_learning_batches.setdefault(key,set()).add(row["result"]["movie_id"])
         pending = sum(row["status"] in {"queued","running","paused"} for row in rows)
         self.online_button.configure(text=f"自动学习 ({pending})" if pending else "自动学习")
         for event in manager.drain_events():
@@ -1173,7 +1908,8 @@ class Studio:
                 continue
             self.online_refresh_pending = True
             row = by_id.get(event.get("job_id"))
-            if self.closing or row is None or not event.get("learn"):
+            if (self.closing or row is None or not event.get("learn") or row.get("learning_cancelled")
+                    or not self._continuous_handoff_allowed(row)):
                 continue
             version = event.get("request_version",row.get("request_version",0))
             if version!=self.training_cancel_version:
@@ -1181,7 +1917,8 @@ class Studio:
                 continue
             movie_id = event.get("result",{}).get("movie_id")
             if movie_id is not None:
-                key = (row["batch_id"],version)
+                kind = row.get("learning_kind",row.get("config",{}).get("learning_kind","movie-temporal"))
+                key = (row["batch_id"],version,kind)
                 self.online_learning_batches.setdefault(key,set()).add(movie_id)
         if self.online_refresh_pending and not self.busy and not self.closing:
             had_movies = bool(self.movies)
@@ -1190,7 +1927,12 @@ class Studio:
                 self.refresh(reset_batches=True)
             self.online_refresh_pending = False
         for key,ids in list(self.online_learning_batches.items()):
-            batch,version = key
+            batch,version,kind = key
+            if any(row["batch_id"]==batch and not self._continuous_handoff_allowed(row) for row in rows):
+                continue
+            retry = getattr(self,"auto_handoff_retries",{}).get(key,{})
+            if time.monotonic() < retry.get("after",0):
+                continue
             if version!=self.training_cancel_version or self.closing:
                 del self.online_learning_batches[key]
                 continue
@@ -1204,12 +1946,33 @@ class Studio:
                 ids.update(row["result"]["movie_id"] for row in rows
                            if row["batch_id"]==batch and row["status"]=="completed"
                            and row.get("learn",row.get("config",{}).get("learn"))
+                           and not row.get("learning_cancelled")
+                           and row.get("learning_kind",row.get("config",{}).get("learning_kind","movie-temporal"))==kind
                            and row.get("request_version",0)==version
                            and row.get("result",{}).get("movie_id") is not None)
                 try:
-                    self.learn_imported_movies(sorted(ids),request_version=version)
+                    if kind in {"story-reference","story-and-movie"}:
+                        learn = self.learn_discovered_movies if kind=="story-and-movie" else self.learn_auto_movies
+                        accepted = learn(sorted(ids),request_version=version)
+                        if accepted:
+                            manager.acknowledge_learning([row["id"] for row in rows
+                                if row["batch_id"]==batch and row["status"]=="completed" and
+                                row.get("result",{}).get("movie_id") in ids and
+                                row.get("learning_kind",row.get("config",{}).get("learning_kind","movie-temporal"))==kind])
+                            getattr(self,"auto_handoff_retries",{}).pop(key,None)
+                        else:
+                            self.online_learning_batches[key] = ids
+                    else:
+                        self.learn_imported_movies(sorted(ids),request_version=version)
                 except Exception as exc:
                     self.feed_status.set(f"在线视频已导入，自动学习未启动 · {exc}")
+                    if kind in {"story-reference","story-and-movie"}:
+                        self.online_learning_batches[key] = ids
+                        if not hasattr(self,"auto_handoff_retries"):
+                            self.auto_handoff_retries = {}
+                        attempts = retry.get("attempts",0)+1
+                        self.auto_handoff_retries[key] = {"attempts":attempts,
+                            "after":time.monotonic()+min(30,2**min(attempts,5))}
 
     def learn_imported_movie(self, movie_id, *, request_version=None):
         return self.learn_imported_movies([movie_id],request_version=request_version)
@@ -1237,13 +2000,15 @@ class Studio:
         return self.submit_movie_config(cfg,merge_pending=True,
                                         purpose="online-selected" if selected_only else "online-auto")
 
-    def submit_movie_config(self,cfg,*,merge_pending=False,purpose="manual-train"):
+    def submit_movie_config(self,cfg,*,merge_pending=False,purpose="manual-train",review_profiles=True):
         from movie_sequence_data import snapshot_sources
         cfg = dict(cfg)
+        continuous = getattr(self,"continuous_learning_manager",None)
+        cfg["_continuous"] = bool(purpose=="discovery-auto" and continuous and continuous.active)
         if self.storage_busy():
             self.feed_status.set("缓存管理正在执行，完成后可继续学习")
             return False
-        if not self.ensure_movie_profiles(cfg["movie_ids"],
+        if review_profiles and not self.ensure_movie_profiles(cfg["movie_ids"],
                 lambda:self.submit_movie_config(cfg,merge_pending=merge_pending,purpose=purpose),purpose=purpose):
             return "waiting-profiles"
         reviewed = snapshot_sources(self.root,cfg["movie_ids"])
@@ -1251,6 +2016,11 @@ class Studio:
                    getattr(self,"feed_snapshot",None) if self.training_kind=="movie-temporal"
                    and getattr(self,"feed_pending",False) else None)
         if merge_pending and self.training and pending and "movies" in pending:
+            previous_cfg = (self.pending_movie_learning[0] if self.pending_movie_learning else
+                            getattr(self,"feed_movie_settings",None) or {})
+            # A mixed manual/automatic batch belongs to the manual workflow;
+            # stopping continuous mode must not discard a user's reviewed work.
+            cfg["_continuous"] = cfg["_continuous"] and bool(previous_cfg.get("_continuous"))
             from movie_sequence_data import fingerprint
             movies = {movie["id"]:movie for movie in pending["movies"]}
             movies.update({movie["id"]:movie for movie in reviewed["movies"]})
@@ -1495,7 +2265,7 @@ class Studio:
                              kind="annotations")
 
     def launch_training(self, weights, epochs, device, previous=None, *, reviewed=None,kind="annotations",sample_fps=1.,
-                        patience=5,learning_rate=.001,restart=False):
+                        patience=5,learning_rate=.001,restart=False,continuous=False):
         from film_learning import new_run_path
 
         if self.storage_busy():
@@ -1511,12 +2281,15 @@ class Studio:
         if kind=="movie-temporal":
             job.update(sample_fps=sample_fps,movie_count=len(reviewed["movies"]),movie_ids=[m["id"] for m in reviewed["movies"]],patience=patience,
                        learning_rate=learning_rate,restart=restart)
+            job["continuous_learning"] = bool(continuous)
         save_job(root,run.name,job)
         logfile = root/"logs"/(run.name+"-train.log")
         self.training = (weights,epochs,device,run,previous)
         self.training_kind = kind
+        self.continuous_training_run = run.name if continuous and kind=="movie-temporal" else None
+        self.continuous_training_stop = False
         self.training_sample_fps = sample_fps
-        self.training_movie_options = {"patience":patience,"learning_rate":learning_rate,"restart":False}
+        self.training_movie_options = {"patience":patience,"learning_rate":learning_rate,"restart":False,"continuous":bool(continuous)}
         if kind=="movie-temporal" and self.movie_training_settings:
             self.movie_training_settings["restart"] = False
         self.training_stop.clear()
@@ -1576,7 +2349,23 @@ class Studio:
                                  "已排队 · 当前轮结束后读取已确认标注")
 
     def stop_training(self):
+        continuous = getattr(self,"continuous_learning_manager",None)
+        if continuous and continuous.active:
+            self.stop_continuous_learning()
+        self.continuous_training_stop = False
         self.training_cancel_version += 1
+        # Persist cancellation of outstanding automatic handoffs so reopening
+        # the project cannot resurrect a request the user stopped.
+        manager = getattr(self,"online_manager",None)
+        if manager is not None:
+            ids = [row["id"] for row in manager.list_jobs()
+                   if row.get("learning_kind",row.get("config",{}).get("learning_kind")) in {"story-reference","story-and-movie"}
+                   and not row.get("learning_dispatched")]
+            if ids:
+                manager.cancel_learning(ids)
+        automatic = getattr(self,"auto_learning_manager",None)
+        if automatic is not None:
+            automatic.pause()
         self.online_learning_batches.clear()
         self.profile_waiting = {}
         self.feed_movie_settings = None
@@ -1597,6 +2386,9 @@ class Studio:
             return
         weights,epochs,device,run,previous = self.training
         stopped = self.training_stop.is_set()
+        continuous_stop = bool(getattr(self,"continuous_training_stop",False) and
+                               run.name==getattr(self,"continuous_training_run",None))
+        self.continuous_training_stop = False
         self.training = None
         self.training_status.set(message)
         self.training_dot.configure(style=f"{'idle' if stopped else 'ready' if kind=='train_done' else 'error'}.Dot.TLabel")
@@ -1604,7 +2396,8 @@ class Studio:
         reviewed,self.feed_snapshot = self.feed_snapshot,None
         next_cfg,self.feed_movie_settings = getattr(self,"feed_movie_settings",None),None
         self.feed_status.set("")
-        if pending and not stopped and not self.closing and (kind=="train_done" or reviewed is not None):
+        resume_manual = continuous_stop and not (next_cfg or {}).get("_continuous")
+        if pending and (not stopped or resume_manual) and not self.closing and (kind=="train_done" or reviewed is not None):
             checkpoint = run/"fit/weights/best.pt"
             completed = run/"completed.json"
             if completed.is_file():
@@ -1620,7 +2413,7 @@ class Studio:
             self.launch_training(weights,epochs,device,previous,reviewed=reviewed,kind=self.training_kind,**kwargs)
             return
         queued,self.pending_movie_learning = self.pending_movie_learning,None
-        if queued and not stopped and not self.closing:
+        if queued and (not stopped or continuous_stop and not queued[0].get("_continuous")) and not self.closing:
             cfg,reviewed = queued
             self.launch_training(cfg["weights"],cfg["epochs"],cfg["device"],
                                  self.latest_completed(self.root,kind="movie-temporal"),reviewed=reviewed,
@@ -1684,6 +2477,11 @@ class Studio:
     def close(self):
         if self.closing:
             return
+        if self.story_busy():
+            self.status.set("小说成片正在生成、学习或导出，请等待完成后再退出")
+            if getattr(self,'story_window',None) and self.story_window.busy:self.activate_page("story",self.story_window.win)
+            else:self.show_learning_dashboard()
+            return
         if self.project_transfer:
             self.status.set("工程迁移正在执行，请等待完成后再退出")
             return
@@ -1693,7 +2491,7 @@ class Studio:
             return
         if self.training and not messagebox.askyesno("退出映格","训练仍在运行。要停止训练并退出吗？",parent=self.win):
             return
-        for name in ("profile_window","cache_window","training_window"):
+        for name in ("story_window","profile_window","cache_window","training_window"):
             window = getattr(self,name,None)
             if window and window.win.winfo_exists():
                 if window.close() is False:

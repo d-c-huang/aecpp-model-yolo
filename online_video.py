@@ -86,13 +86,98 @@ def _inside(folder, value):
     return path
 
 
+_RESTRICTED_ERRORS = {
+    "youku_restricted_6004": "优酷限制了此视频的播放（错误 -6004），无法直接下载。",
+    "drm_protected": "此视频受 DRM 或加密保护，无法直接读取。",
+    "content_access_restricted": "此视频明确受会员、试看或 DRM 权限限制，无法直接下载完整内容。",
+    "login_required": "此视频明确要求登录后播放，当前公开访问无法下载。",
+    "membership_required": "此视频明确需要会员、购买或试看权限，无法直接下载完整内容。",
+    "private_video": "此视频为私有内容或明确拒绝访问，无法直接下载。",
+    "geo_restricted": "此视频明确限制当前地区播放，无法直接下载。",
+}
+
+
+def _error_classification(code):
+    restricted = code in _RESTRICTED_ERRORS
+    return {"error_code": code,
+            "error_category": "restricted" if restricted else "network" if code == "network_error" else "unknown",
+            "restricted": restricted, "skip_reason": _RESTRICTED_ERRORS.get(code, ""),
+            "retryable": not restricted}
+
+
+def classify_online_error(value):
+    """Classify new exceptions and old queue records conservatively.
+
+    Only explicit content restrictions are terminal for automatic learning.
+    Bare HTTP status codes, cookie advice and ambiguous legacy friendly errors
+    are not evidence of a restricted video: URLs may simply have expired.
+    """
+    if isinstance(value, dict):
+        for details in (value.get("error_detail"), value.get("classification"), value):
+            if (isinstance(details, dict) and isinstance(details.get("error_code"), str)
+                    and details["error_code"] in {*_RESTRICTED_ERRORS, "network_error", "download_error"}):
+                return _error_classification(details["error_code"])
+        message = str(value.get("error") or value.get("message") or "")
+        source = str(value.get("url") or "")
+    else:
+        details = getattr(value, "classification", None)
+        if (isinstance(details, dict) and isinstance(details.get("error_code"), str)
+                and details["error_code"] in {*_RESTRICTED_ERRORS, "network_error", "download_error"}):
+            return _error_classification(details["error_code"])
+        message, source = str(value), ""
+    try:
+        source_host = urlsplit(source).hostname
+    except ValueError:
+        source_host = None
+    lower = message.casefold()
+    # Test exact platform error tokens, not a number inside a signed URL.
+    clean = re.sub(r"https?://[^\s\"'<>]+", "[视频来源]", lower)
+    if ("youku" in lower or "优酷" in lower or source_host in {"v.youku.com", "m.youku.com"}) and re.search(r"(?:error|错误)\s*[:：]?\s*-6004\b", clean):
+        return _error_classification("youku_restricted_6004")
+    if "视频受会员、试看或 drm 限制" in clean:
+        return _error_classification("content_access_restricted")
+    # Positive, explicit messages only. Merely mentioning a DRM library or
+    # cookie file must not turn a decoder/network failure into a permanent skip.
+    if not re.search(r"\b(?:not drm|no drm|not protected)\b|不受\s*drm", clean) and (
+            re.search(r"\b(?:drm[ -]protected|protected\s+(?:by|with)\s+drm|has\s+drm|is\s+drm\s+protected|protected content)\b", clean)
+            or any(text in clean for text in ("受 drm 保护", "受drm保护", "受 drm 或加密保护", "包含加密或 drm"))):
+        return _error_classification("drm_protected")
+    if (re.search(r"\b(?:members[ -]only|premium[ -]only|paid content|subscription (?:is )?required|purchase (?:is )?required)\b", clean)
+            or re.search(r"(?<!不)(?:需要会员|需要购买)", clean)
+            or any(text in clean for text in ("仅限会员", "短于检索记录，可能是试看"))):
+        return _error_classification("membership_required")
+    if (re.search(r"\b(?:private video|this video is private|access to (?:this |the )?video (?:is )?denied|you (?:do not|don't) have permission to (?:access|view|watch))\b", clean)
+            or any(text in clean for text in ("此视频为私有", "视频无权访问", "无权观看此视频", "无权限观看"))):
+        return _error_classification("private_video")
+    if (re.search(r"\b(?:(?:this |the )?(?:video|content) is not available in your (?:country|region)|geo[ -]restricted|not available from your location)\b", clean)
+            or any(text in clean for text in ("当前地区无法播放", "所在地区不可用", "地区限制播放", "限制当前地区播放"))):
+        return _error_classification("geo_restricted")
+    if (re.search(r"\b(?:login required|log[ -]?in (?:is )?required|authentication (?:is )?required|sign in to (?:watch|view|access)|log in to (?:watch|view|access))\b", clean)
+            or any(text in clean for text in ("请先登录后观看", "登录后才能观看", "需要登录后播放", "必须登录才能"))):
+        return _error_classification("login_required")
+    if (re.search(r"\b(?:timed out|timeout|connection (?:reset|refused|aborted)|network (?:error|unreachable)|temporary failure in name resolution|name or service not known)\b", clean)
+            or any(text in clean for text in ("连接视频来源失败", "网络超时", "连接超时", "网络连接失败"))):
+        return _error_classification("network_error")
+    return _error_classification("download_error")
+
+
+class OnlineVideoError(ValueError):
+    """A downloader failure retaining classification across the worker boundary."""
+    def __init__(self, message, *, classification=None):
+        super().__init__(message)
+        self.classification = classify_online_error(classification if isinstance(classification, dict) else message)
+        self.error_code = self.classification["error_code"]
+        self.skip_reason = self.classification["skip_reason"]
+
+
 def _friendly_error(value):
     message = str(value)
     lower = message.lower()
-    if any(word in lower for word in ("drm", "protected content")):
-        return "此视频受 DRM 保护，无法读取。请改用可直接读取的视频来源。"
-    if any(word in lower for word in ("sign in", "login", "log in", "cookies", "403", "401", "private video", "members-only")):
-        return "视频来源需要登录或未允许当前请求。请使用可直接访问的链接，或将可播放的视频文件导入工程。"
+    classification = classify_online_error(value)
+    if classification["restricted"]:
+        return classification["skip_reason"]
+    if "iqiyi" in lower and "can't find any video" in lower:
+        return "爱奇艺新版播放页未提供旧版视频字段；请从联网找素材重新搜索加入，或导入本地视频。"
     if any(word in lower for word in ("unsupported url", "no suitable extractor")):
         return "暂不支持这个视频网页。可以改用 MP4/M3U8 直链，或先下载视频文件再导入。"
     if any(word in lower for word in ("timed out", "timeout", "connection", "resolve", "network", "unreachable")):
@@ -230,7 +315,13 @@ def _download_impl(request, emit, factory=None, on_progress=None):
     with factory(options) as ydl:
         details("resolving")
         emit("正在解析在线视频信息…")
-        info = _validate_info(ydl.extract_info(request["url"], download=False))
+        if request.get("source_metadata"):
+            from iqiyi_video import extract_public_video
+            emit("正在读取爱奇艺公开播放信息（使用搜索页的单视频标识）…")
+            raw = extract_public_video(ydl, request["url"], request["source_metadata"])
+            info = _validate_info(ydl.process_ie_result(raw, download=False))
+        else:
+            info = _validate_info(ydl.extract_info(request["url"], download=False))
         _finite_hls(ydl, info)
         title = " ".join(str(info.get("title") or info.get("id") or "在线视频").split())[:180]
         details("downloading")
@@ -368,7 +459,7 @@ def _run_download(folder, request, report, stop, on_progress=None):
             dispatch(events.get_nowait())
         result = _read_json(response_path)
         if proc.returncode or result.get("error"):
-            raise ValueError(result.get("error") or "在线视频后台任务未完成，请重试")
+            raise OnlineVideoError(result.get("error") or "在线视频后台任务未完成，请重试", classification=result)
         if not result.get("path"):
             raise ValueError("在线视频没有生成完整缓存，请重试")
         return result
@@ -516,9 +607,13 @@ def _cache_lock(folder):
         os.close(descriptor)
 
 
-def import_online(root, url, mode, report, *, height=720, subtitles=True, stop=None, on_progress=None):
+def import_online(root, url, mode, report, *, height=720, subtitles=True, stop=None, on_progress=None,
+                  source_metadata=None):
     """Download once, verify a finite local movie, then use existing import logic."""
     url = validate_url(url)
+    if source_metadata is not None:
+        from iqiyi_video import clean_video_metadata
+        source_metadata = clean_video_metadata(url, source_metadata)
     if mode not in {"time", "train", "val"}:
         raise ValueError("请为在线视频选择训练或验证分组")
     if type(height) is not int or height not in {0, 360, 480, 720, 1080, 1440, 2160}:
@@ -540,12 +635,32 @@ def import_online(root, url, mode, report, *, height=720, subtitles=True, stop=N
     progress("准备读取在线视频…")
     config = {"url": url, "height": height, "subtitles": bool(subtitles)}
     key = hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
+    # Search metadata helps resolve a modern playback page, but does not change
+    # the media identity or invalidate a previously verified resumable cache.
+    if source_metadata is not None:
+        config["source_metadata"] = source_metadata
     from cache_storage import locate_cache, storage_lease
     with storage_lease(root):
         folder = locate_cache(root,key)
         folder.mkdir(parents=True, exist_ok=True)
         with _cache_lock(folder):
             return _import_locked(root,folder,config,mode,progress,stop,details)
+
+
+def _same_partial_source(previous, current):
+    """Search presentation changes must not discard resumable media bytes."""
+    if not isinstance(previous, dict):
+        return False
+    if ({key: value for key, value in previous.items() if key != "source_metadata"} !=
+            {key: value for key, value in current.items() if key != "source_metadata"}):
+        return False
+    before, after = previous.get("source_metadata"), current.get("source_metadata")
+    if before is not None and after is not None:
+        # A changed public playback identity can refer to different media even
+        # when a host reuses its page URL. Never append those bytes together.
+        return (isinstance(before, dict) and isinstance(after, dict) and
+                all(before.get(key) == after.get(key) for key in ("tvid", "vid")))
+    return True
 
 
 def _import_locked(root, folder, config, mode, progress, stop, details):
@@ -560,9 +675,13 @@ def _import_locked(root, folder, config, mode, progress, stop, details):
     else:
         pending = _read_json(folder/"pending.json")
         attempt = folder/pending.get("attempt", "")
-        if not (pending.get("config")==config and attempt.name.startswith("attempt-") and attempt.is_dir()):
+        if not (_same_partial_source(pending.get("config"), config) and attempt.name.startswith("attempt-") and attempt.is_dir()):
             attempt = folder/("attempt-"+uuid.uuid4().hex)
             attempt.mkdir()
+            _write_json(folder/"pending.json", {"config": config, "attempt": attempt.name})
+        elif config.get("source_metadata") is not None and pending.get("config") != config:
+            # Remember a newly learned media identity for later retries. A call
+            # without metadata must not erase the identity of existing bytes.
             _write_json(folder/"pending.json", {"config": config, "attempt": attempt.name})
         attempt = _inside(folder, attempt)
         info = _run_download(attempt, {**config, "folder": str(attempt)}, progress, stop, details)
@@ -643,6 +762,6 @@ if __name__=="__main__":
                                 lambda message: print(json.dumps({"progress":message}, ensure_ascii=False), flush=True),
                                 on_progress=lambda event: print(json.dumps({"details":event}, ensure_ascii=False), flush=True))
     except Exception as exc:
-        _write_json(response, {"error": _friendly_error(exc)})
+        _write_json(response, {"error": _friendly_error(exc), **classify_online_error(exc)})
         raise SystemExit(1)
     _write_json(response, result)
